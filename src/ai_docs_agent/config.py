@@ -47,6 +47,20 @@ class AppSettings(BaseSettings):
         default=1, validation_alias="PINECONE_SMOKE_POLL_INTERVAL_SECONDS"
     )
 
+    url_fetch_timeout_seconds: float = Field(
+        default=15, validation_alias="URL_FETCH_TIMEOUT_SECONDS"
+    )
+    url_max_response_bytes: int = Field(
+        default=2_000_000, validation_alias="URL_MAX_RESPONSE_BYTES"
+    )
+    url_max_redirects: int = Field(default=5, validation_alias="URL_MAX_REDIRECTS")
+    url_min_text_chars: int = Field(default=200, validation_alias="URL_MIN_TEXT_CHARS")
+    url_user_agent: str = Field(
+        default="ai-docs-rag-agent/0.1", validation_alias="URL_USER_AGENT"
+    )
+    chunk_size: int = Field(default=1200, validation_alias="CHUNK_SIZE")
+    chunk_overlap: int = Field(default=200, validation_alias="CHUNK_OVERLAP")
+
     @field_validator("pinecone_dimension")
     @classmethod
     def _validate_dimension(cls, value: int) -> int:
@@ -93,6 +107,55 @@ class AppSettings(BaseSettings):
             )
         return value
 
+    @field_validator("url_fetch_timeout_seconds")
+    @classmethod
+    def _validate_url_fetch_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("url_fetch_timeout_seconds must be greater than zero.")
+        return value
+
+    @field_validator("url_max_response_bytes")
+    @classmethod
+    def _validate_url_max_response_bytes(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("url_max_response_bytes must be greater than zero.")
+        return value
+
+    @field_validator("url_max_redirects")
+    @classmethod
+    def _validate_url_max_redirects(cls, value: int) -> int:
+        if value < 0 or value > 10:
+            raise ValueError("url_max_redirects must be between 0 and 10 inclusive.")
+        return value
+
+    @field_validator("url_min_text_chars")
+    @classmethod
+    def _validate_url_min_text_chars(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("url_min_text_chars must be greater than zero.")
+        return value
+
+    @field_validator("url_user_agent")
+    @classmethod
+    def _validate_url_user_agent(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("url_user_agent must not be empty.")
+        return value
+
+    @field_validator("chunk_size")
+    @classmethod
+    def _validate_chunk_size(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("chunk_size must be greater than zero.")
+        return value
+
+    @field_validator("chunk_overlap")
+    @classmethod
+    def _validate_chunk_overlap(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("chunk_overlap must be greater than or equal to zero.")
+        return value
+
     @model_validator(mode="after")
     def _validate_poll_interval_within_timeout(self) -> "AppSettings":
         if self.pinecone_smoke_poll_interval_seconds > self.pinecone_smoke_timeout_seconds:
@@ -100,6 +163,12 @@ class AppSettings(BaseSettings):
                 "pinecone_smoke_poll_interval_seconds cannot exceed "
                 "pinecone_smoke_timeout_seconds."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_chunk_overlap_within_chunk_size(self) -> "AppSettings":
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk_overlap must be strictly less than chunk_size.")
         return self
 
 

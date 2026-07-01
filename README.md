@@ -2,7 +2,8 @@
 
 Telegram RAG-агент для работы с технической документацией.
 
-**Статус: typed configuration + Pinecone index management and integration smoke-test.**
+**Статус: typed configuration + Pinecone index management/smoke-test + URL ingestion and
+chunking pipeline (embeddings/Pinecone upsert для URL ещё не реализованы).**
 
 ## Планируемые возможности
 
@@ -28,10 +29,76 @@ LangChain agent, tools и Telegram-интерфейс отсутствуют.
 - типизированная конфигурация приложения (`AppSettings`, `pydantic-settings`);
 - управление Pinecone-индексом (`PineconeStore.ensure_index`);
 - live-интеграционный smoke-test: OpenAI embedding → Pinecone upsert → query → cleanup
-  (`PineconeStore.smoke_test`).
+  (`PineconeStore.smoke_test`);
+- URL ingestion и chunking pipeline (`UrlIngestionService.process_url`): валидация URL,
+  ограниченная по размеру и redirect'ам загрузка HTML, извлечение и нормализация текста,
+  детерминированные ID документа/чанков и разбиение на чанки. Embeddings и запись чанков в
+  Pinecone на этом этапе **не выполняются** — это следующий этап.
 
-Остальные модули (`url_ingestion.py`, `retrieval.py`, `memory.py`, `tools.py`, `agent.py`,
-`telegram_bot.py`) по-прежнему содержат только module docstring.
+Остальные модули (`retrieval.py`, `memory.py`, `tools.py`, `agent.py`, `telegram_bot.py`)
+по-прежнему содержат только module docstring.
+
+### URL ingestion и chunking pipeline
+
+`src/ai_docs_agent/url_ingestion.py` определяет `UrlIngestionService.process_url(url)`,
+реализующий pipeline:
+
+```
+URL → validation (scheme/host/SSRF guard) → bounded-redirect HTTP fetch →
+bounded response size → HTML extraction → normalized text →
+deterministic document ID → RecursiveCharacterTextSplitter → deterministic chunks
+```
+
+Результат — `UrlProcessingResult` с готовыми `DocumentChunk` в памяти. Ничего не
+записывается в Pinecone и не отправляется в OpenAI на этом этапе.
+
+**SSRF guard — best-effort защита, а не абсолютная гарантия безопасности.** Проверяются
+схема (`http`/`https`), отсутствие credentials в URL, `localhost`/`*.localhost`, и все
+resolved-адреса hostname (через injectable DNS resolver) на loopback/private/link-local/
+multicast/reserved/unspecified диапазоны — при каждом redirect повторно. Hostname перед
+всеми этими проверками (и перед вызовом resolver'а) нормализуется: lowercase и удаление
+конечных точек — это закрывает обход вида `localhost.`/`LOCALHOST.`/`app.localhost.`, при
+котором literal-проверка ранее выполнялась до нормализации. Это снижает риск базовых
+SSRF-сценариев, но не заменяет сетевые egress-ограничения на инфраструктурном уровне
+(например, DNS rebinding между проверкой и фактическим TCP-соединением остаётся
+теоретически возможным).
+
+Поддерживаемые `Content-Type`: `text/html`, `application/xhtml+xml` (с необязательным
+`charset`). Остальные типы отклоняются (`UnsupportedContentTypeError`). Неизвестный или
+невалидный `charset` (например, `charset=definitely-not-a-codec`) не приводит к raw
+`LookupError` — тело ответа при этом не читается силой в случайной кодировке, а fetch
+завершается controlled-ошибкой `ContentExtractionError` (с исходным `LookupError` в
+`__cause__`, без утечки HTML body).
+
+Извлечение текста нормализует обычную prose (схлопывание пробелов/пустых строк), но
+сохраняет форматирование блоков `<pre>`/`<pre><code>` (значимые leading-отступы и
+внутренняя индентация не удаляются) — это важно для технической документации с
+примерами кода/конфигов.
+
+Ограничения (настраиваются через `.env`, см. ниже):
+
+- `URL_FETCH_TIMEOUT_SECONDS` — таймаут HTTP-запроса;
+- `URL_MAX_RESPONSE_BYTES` — лимит размера тела ответа (проверяется по `Content-Length` до
+  чтения тела **и** по фактически прочитанным байтам во время потокового чтения — чтение
+  прекращается сразу при превышении);
+- `URL_MAX_REDIRECTS` — максимум HTTP-redirect'ов (redirect обрабатывается вручную,
+  `follow_redirects=False`; каждый redirect-target заново проходит полную URL/DNS
+  валидацию);
+- `URL_MIN_TEXT_CHARS` — минимальная длина извлечённого текста;
+- `CHUNK_SIZE` / `CHUNK_OVERLAP` — параметры `RecursiveCharacterTextSplitter`.
+
+Document ID и chunk ID детерминированы (SHA-256 от `final_url` + content hash) — одна и та
+же страница с тем же содержимым всегда даёт одни и те же ID; изменившийся контент даёт
+новый document ID.
+
+Предпросмотр pipeline без записи куда-либо:
+
+```
+python scripts/url_preview.py "https://example.com/docs"
+```
+
+Следующий этап: embeddings для URL-чанков и их запись в Pinecone (URL ingestion →
+embeddings → Pinecone upsert).
 
 ### Typed configuration
 
@@ -65,9 +132,11 @@ region. Существующий индекс никогда не пересоз
 
 ### Unit tests vs. live smoke-test
 
-- `pytest` (`tests/test_config.py`, `tests/test_pinecone_store.py`,
-  `tests/test_pinecone_smoke_script.py`) — быстрые unit-тесты на fake-объектах, без сети,
-  без реальных ключей, без реальных задержек.
+- `pytest` (`tests/test_config.py`, `tests/test_models.py`, `tests/test_pinecone_store.py`,
+  `tests/test_pinecone_smoke_script.py`, `tests/test_url_ingestion.py`,
+  `tests/test_url_preview_script.py`) — быстрые unit-тесты на fake-объектах, без сети, без
+  реального DNS, без реальных ключей, без реальных задержек. HTTP fake'ается через
+  `httpx.MockTransport`, DNS — через injectable resolver.
 - `scripts/pinecone_smoke_test.py` — **live**-скрипт, выполняющий реальные вызовы OpenAI и
   Pinecone. Требует настоящих `OPENAI_API_KEY` и `PINECONE_API_KEY` и создаёт/удаляет один
   реальный вектор в Pinecone. Не запускается автоматически и не входит в тестовый набор.
@@ -75,6 +144,9 @@ region. Существующий индекс никогда не пересоз
   удаление тестового вектора тоже прошло успешно; если pipeline прошёл, но cleanup не
   удался, скрипт печатает `Pinecone smoke test FAILED: cleanup did not complete` и
   возвращает exit code `2` (домен/выполнение — `1`).
+- `scripts/url_preview.py` — выполняет реальный HTTP-запрос к переданному URL (но не
+  OpenAI/Pinecone) — тоже не входит в автоматический тестовый набор; тестируется только его
+  чистая функция форматирования и `main()` с внедрённым fake-сервисом.
 
 ## Требования
 
@@ -127,6 +199,12 @@ python scripts/smoke_test.py
 
 ```
 python scripts/pinecone_smoke_test.py
+```
+
+## URL ingestion preview (live HTTP-запрос к переданному URL, без OpenAI/Pinecone)
+
+```
+python scripts/url_preview.py "https://example.com/docs"
 ```
 
 ## Безопасность

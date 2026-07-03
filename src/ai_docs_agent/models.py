@@ -1,6 +1,6 @@
 """Result and status models for Pinecone index operations and URL ingestion."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -386,3 +386,20 @@ class GroundedAnswerResult(BaseModel):
         if self.retrieved_chunk_count > 0 and not self.sources:
             raise ValueError("sources must not be empty when retrieved_chunk_count is positive.")
         return self
+
+
+class ConversationMessage(BaseModel):
+    """A single short-term conversation-memory message (user or assistant turn)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def _validate_content(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("content must not be blank.")
+        return stripped

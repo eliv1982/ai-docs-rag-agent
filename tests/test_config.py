@@ -36,6 +36,13 @@ _ALL_SETTINGS_ENV_VARS = (
     "URL_USER_AGENT",
     "CHUNK_SIZE",
     "CHUNK_OVERLAP",
+    "PINECONE_DOCUMENTS_NAMESPACE",
+    "EMBEDDING_BATCH_SIZE",
+    "PINECONE_UPSERT_BATCH_SIZE",
+    "PINECONE_FETCH_BATCH_SIZE",
+    "PINECONE_INDEX_VERIFY_TIMEOUT_SECONDS",
+    "PINECONE_INDEX_VERIFY_POLL_INTERVAL_SECONDS",
+    "PINECONE_REPLACE_OLD_SOURCE_VERSIONS",
 )
 
 
@@ -64,6 +71,13 @@ def test_defaults() -> None:
     assert settings.url_user_agent == "ai-docs-rag-agent/0.1"
     assert settings.chunk_size == 1200
     assert settings.chunk_overlap == 200
+    assert settings.pinecone_documents_namespace == "documentation"
+    assert settings.embedding_batch_size == 64
+    assert settings.pinecone_upsert_batch_size == 100
+    assert settings.pinecone_fetch_batch_size == 500
+    assert settings.pinecone_index_verify_timeout_seconds == 30
+    assert settings.pinecone_index_verify_poll_interval_seconds == 1
+    assert settings.pinecone_replace_old_source_versions is True
 
 
 def test_overrides_are_applied() -> None:
@@ -170,6 +184,81 @@ def test_rejects_negative_chunk_overlap() -> None:
 def test_rejects_chunk_overlap_greater_than_or_equal_to_chunk_size() -> None:
     with pytest.raises(ValidationError):
         make_settings(chunk_size=100, chunk_overlap=100)
+
+
+def test_overrides_are_applied_for_indexing_settings() -> None:
+    settings = make_settings(
+        pinecone_documents_namespace="custom-namespace",
+        embedding_batch_size=32,
+        pinecone_upsert_batch_size=50,
+        pinecone_fetch_batch_size=250,
+        pinecone_index_verify_timeout_seconds=15,
+        pinecone_index_verify_poll_interval_seconds=2,
+        pinecone_replace_old_source_versions=False,
+    )
+
+    assert settings.pinecone_documents_namespace == "custom-namespace"
+    assert settings.embedding_batch_size == 32
+    assert settings.pinecone_upsert_batch_size == 50
+    assert settings.pinecone_fetch_batch_size == 250
+    assert settings.pinecone_index_verify_timeout_seconds == 15
+    assert settings.pinecone_index_verify_poll_interval_seconds == 2
+    assert settings.pinecone_replace_old_source_versions is False
+
+
+def test_pinecone_documents_namespace_is_stripped() -> None:
+    settings = make_settings(pinecone_documents_namespace="  documentation  ")
+
+    assert settings.pinecone_documents_namespace == "documentation"
+
+
+def test_rejects_empty_pinecone_documents_namespace() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pinecone_documents_namespace="   ")
+
+
+def test_rejects_non_positive_embedding_batch_size() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(embedding_batch_size=0)
+
+
+def test_rejects_non_positive_pinecone_upsert_batch_size() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pinecone_upsert_batch_size=0)
+
+
+def test_rejects_non_positive_pinecone_fetch_batch_size() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pinecone_fetch_batch_size=0)
+
+
+def test_rejects_pinecone_fetch_batch_size_above_1000() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pinecone_fetch_batch_size=1001)
+
+
+def test_accepts_pinecone_fetch_batch_size_boundary_value() -> None:
+    settings = make_settings(pinecone_fetch_batch_size=1000)
+
+    assert settings.pinecone_fetch_batch_size == 1000
+
+
+def test_rejects_non_positive_index_verify_timeout() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pinecone_index_verify_timeout_seconds=0)
+
+
+def test_rejects_non_positive_index_verify_poll_interval() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pinecone_index_verify_poll_interval_seconds=0)
+
+
+def test_rejects_index_verify_poll_interval_greater_than_timeout() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(
+            pinecone_index_verify_timeout_seconds=5,
+            pinecone_index_verify_poll_interval_seconds=10,
+        )
 
 
 def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

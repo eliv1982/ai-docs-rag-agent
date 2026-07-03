@@ -61,6 +61,26 @@ class AppSettings(BaseSettings):
     chunk_size: int = Field(default=1200, validation_alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=200, validation_alias="CHUNK_OVERLAP")
 
+    pinecone_documents_namespace: str = Field(
+        default="documentation", validation_alias="PINECONE_DOCUMENTS_NAMESPACE"
+    )
+    embedding_batch_size: int = Field(default=64, validation_alias="EMBEDDING_BATCH_SIZE")
+    pinecone_upsert_batch_size: int = Field(
+        default=100, validation_alias="PINECONE_UPSERT_BATCH_SIZE"
+    )
+    pinecone_fetch_batch_size: int = Field(
+        default=500, validation_alias="PINECONE_FETCH_BATCH_SIZE"
+    )
+    pinecone_index_verify_timeout_seconds: float = Field(
+        default=30, validation_alias="PINECONE_INDEX_VERIFY_TIMEOUT_SECONDS"
+    )
+    pinecone_index_verify_poll_interval_seconds: float = Field(
+        default=1, validation_alias="PINECONE_INDEX_VERIFY_POLL_INTERVAL_SECONDS"
+    )
+    pinecone_replace_old_source_versions: bool = Field(
+        default=True, validation_alias="PINECONE_REPLACE_OLD_SOURCE_VERSIONS"
+    )
+
     @field_validator("pinecone_dimension")
     @classmethod
     def _validate_dimension(cls, value: int) -> int:
@@ -156,6 +176,53 @@ class AppSettings(BaseSettings):
             raise ValueError("chunk_overlap must be greater than or equal to zero.")
         return value
 
+    @field_validator("pinecone_documents_namespace")
+    @classmethod
+    def _validate_pinecone_documents_namespace(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("pinecone_documents_namespace must not be empty.")
+        return stripped
+
+    @field_validator("embedding_batch_size")
+    @classmethod
+    def _validate_embedding_batch_size(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("embedding_batch_size must be greater than zero.")
+        return value
+
+    @field_validator("pinecone_upsert_batch_size")
+    @classmethod
+    def _validate_pinecone_upsert_batch_size(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("pinecone_upsert_batch_size must be greater than zero.")
+        return value
+
+    @field_validator("pinecone_fetch_batch_size")
+    @classmethod
+    def _validate_pinecone_fetch_batch_size(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("pinecone_fetch_batch_size must be greater than zero.")
+        if value > 1000:
+            raise ValueError("pinecone_fetch_batch_size must not exceed 1000.")
+        return value
+
+    @field_validator("pinecone_index_verify_timeout_seconds")
+    @classmethod
+    def _validate_index_verify_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("pinecone_index_verify_timeout_seconds must be greater than zero.")
+        return value
+
+    @field_validator("pinecone_index_verify_poll_interval_seconds")
+    @classmethod
+    def _validate_index_verify_poll_interval(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError(
+                "pinecone_index_verify_poll_interval_seconds must be greater than zero."
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_poll_interval_within_timeout(self) -> "AppSettings":
         if self.pinecone_smoke_poll_interval_seconds > self.pinecone_smoke_timeout_seconds:
@@ -169,6 +236,18 @@ class AppSettings(BaseSettings):
     def _validate_chunk_overlap_within_chunk_size(self) -> "AppSettings":
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("chunk_overlap must be strictly less than chunk_size.")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_index_verify_poll_interval_within_timeout(self) -> "AppSettings":
+        if (
+            self.pinecone_index_verify_poll_interval_seconds
+            > self.pinecone_index_verify_timeout_seconds
+        ):
+            raise ValueError(
+                "pinecone_index_verify_poll_interval_seconds cannot exceed "
+                "pinecone_index_verify_timeout_seconds."
+            )
         return self
 
 

@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from ai_docs_agent.models import DocumentChunk, UrlProcessingResult
+from ai_docs_agent.models import DocumentChunk, DocumentIndexingResult, UrlProcessingResult
 
 
 def make_chunk(**overrides: Any) -> DocumentChunk:
@@ -163,3 +163,118 @@ def test_url_processing_result_is_frozen() -> None:
 def test_url_processing_result_rejects_extra_fields() -> None:
     with pytest.raises(ValidationError):
         make_result(unexpected="field")
+
+
+# --- DocumentIndexingResult ---------------------------------------------------
+
+
+def make_indexing_result(**overrides: Any) -> DocumentIndexingResult:
+    defaults: dict[str, Any] = {
+        "source_url": "https://docs.example.com/page",
+        "final_url": "https://docs.example.com/page",
+        "document_id": "doc-abc123",
+        "content_hash": "hash-value",
+        "namespace": "documentation",
+        "chunk_count": 3,
+        "embedded_count": 3,
+        "upserted_count": 3,
+        "verified_count": 3,
+        "old_versions_cleanup_requested": True,
+        "old_versions_cleanup_succeeded": True,
+        "elapsed_seconds": 1.5,
+    }
+    return DocumentIndexingResult(**{**defaults, **overrides})
+
+
+def test_document_indexing_result_accepts_consistent_values() -> None:
+    result = make_indexing_result()
+
+    assert result.chunk_count == 3
+    assert result.old_versions_cleanup_succeeded is True
+
+
+def test_document_indexing_result_rejects_non_positive_chunk_count() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(chunk_count=0)
+
+
+def test_document_indexing_result_rejects_negative_embedded_count() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(embedded_count=-1)
+
+
+def test_document_indexing_result_rejects_negative_upserted_count() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(upserted_count=-1)
+
+
+def test_document_indexing_result_rejects_negative_verified_count() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(verified_count=-1)
+
+
+def test_document_indexing_result_rejects_embedded_count_mismatch() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(embedded_count=2)
+
+
+def test_document_indexing_result_rejects_upserted_count_mismatch() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(upserted_count=2)
+
+
+def test_document_indexing_result_rejects_verified_count_mismatch() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(verified_count=2)
+
+
+def test_document_indexing_result_rejects_negative_elapsed_seconds() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(elapsed_seconds=-0.1)
+
+
+def test_document_indexing_result_allows_zero_elapsed_seconds() -> None:
+    result = make_indexing_result(elapsed_seconds=0)
+
+    assert result.elapsed_seconds == 0
+
+
+def test_document_indexing_result_cleanup_not_requested_forbids_bool_status() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(
+            old_versions_cleanup_requested=False, old_versions_cleanup_succeeded=True
+        )
+
+
+def test_document_indexing_result_cleanup_not_requested_allows_none_status() -> None:
+    result = make_indexing_result(
+        old_versions_cleanup_requested=False, old_versions_cleanup_succeeded=None
+    )
+
+    assert result.old_versions_cleanup_succeeded is None
+
+
+def test_document_indexing_result_cleanup_requested_forbids_none_status() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(
+            old_versions_cleanup_requested=True, old_versions_cleanup_succeeded=None
+        )
+
+
+def test_document_indexing_result_cleanup_requested_allows_false_status() -> None:
+    result = make_indexing_result(
+        old_versions_cleanup_requested=True, old_versions_cleanup_succeeded=False
+    )
+
+    assert result.old_versions_cleanup_succeeded is False
+
+
+def test_document_indexing_result_is_frozen() -> None:
+    result = make_indexing_result()
+    with pytest.raises(ValidationError):
+        result.document_id = "mutated"  # type: ignore[misc]
+
+
+def test_document_indexing_result_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        make_indexing_result(unexpected="field")

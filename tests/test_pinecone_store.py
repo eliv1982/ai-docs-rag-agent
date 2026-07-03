@@ -8,12 +8,18 @@ import pytest
 from ai_docs_agent.config import AppSettings
 from ai_docs_agent.models import PineconeSmokeTestResult
 from ai_docs_agent.pinecone_store import (
+    PineconeDeleteError,
+    PineconeEmbeddingError,
+    PineconeFetchError,
     PineconeIndexConfigurationError,
     PineconeIndexNotFoundError,
     PineconeSmokeTestError,
     PineconeStore,
     PineconeStoreError,
+    PineconeUpsertError,
 )
+
+_AUTO = object()
 
 _REQUIRED: dict[str, Any] = {
     "openai_api_key": "sk-test-openai",
@@ -71,14 +77,29 @@ class RaisingEmbeddings:
 class FakeIndexHandle:
     """Fake Pinecone Index handle that becomes query-visible after N queries."""
 
-    def __init__(self, *, visible_after: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        visible_after: int = 0,
+        upsert_response: Any = _AUTO,
+        fetch_response: Any = _AUTO,
+    ) -> None:
         self.upserted: list[dict[str, Any]] = []
         self.deleted: list[dict[str, Any]] = []
+        self.fetch_calls: list[dict[str, Any]] = []
         self._visible_after = visible_after
         self.query_calls = 0
+        self.existing_ids: set[str] = set()
+        self._upsert_response = upsert_response
+        self._fetch_response = fetch_response
 
-    def upsert(self, *, vectors: list[dict[str, Any]], namespace: str) -> None:
+    def upsert(self, *, vectors: list[dict[str, Any]], namespace: str) -> Any:
         self.upserted.append({"vectors": vectors, "namespace": namespace})
+        for vector in vectors:
+            self.existing_ids.add(vector["id"])
+        if self._upsert_response is _AUTO:
+            return SimpleNamespace(upserted_count=len(vectors))
+        return self._upsert_response
 
     def query(self, *, vector: list[float], top_k: int, include_metadata: bool, namespace: str):
         self.query_calls += 1
@@ -87,18 +108,96 @@ class FakeIndexHandle:
         record = self.upserted[-1]["vectors"][0]
         return SimpleNamespace(matches=[SimpleNamespace(id=record["id"], score=0.987)])
 
-    def delete(self, *, ids: list[str], namespace: str) -> None:
-        self.deleted.append({"ids": ids, "namespace": namespace})
+    def fetch(self, *, ids: list[str], namespace: str) -> Any:
+        self.fetch_calls.append({"ids": list(ids), "namespace": namespace})
+        if self._fetch_response is not _AUTO:
+            return self._fetch_response
+        found = {
+            vec_id: SimpleNamespace(id=vec_id) for vec_id in ids if vec_id in self.existing_ids
+        }
+        return SimpleNamespace(vectors=found)
+
+    def delete(
+        self,
+        *,
+        ids: list[str] | None = None,
+        filter: dict[str, Any] | None = None,  # noqa: A002 - matches Pinecone SDK kwarg
+        namespace: str,
+    ) -> None:
+        entry: dict[str, Any] = {"namespace": namespace}
+        if ids is not None:
+            entry["ids"] = ids
+            for vec_id in ids:
+                self.existing_ids.discard(vec_id)
+        if filter is not None:
+            entry["filter"] = filter
+        self.deleted.append(entry)
 
 
 class FailingDeleteIndexHandle(FakeIndexHandle):
-    def delete(self, *, ids: list[str], namespace: str) -> None:
+    def delete(
+        self,
+        *,
+        ids: list[str] | None = None,
+        filter: dict[str, Any] | None = None,  # noqa: A002 - matches Pinecone SDK kwarg
+        namespace: str,
+    ) -> None:
         raise RuntimeError("delete backend unavailable")
 
 
 class RaisingQueryIndexHandle(FakeIndexHandle):
     def query(self, **kwargs: Any):
         raise RuntimeError("query backend unavailable")
+
+
+class RaisingUpsertIndexHandle(FakeIndexHandle):
+    def upsert(self, *, vectors: list[dict[str, Any]], namespace: str) -> Any:
+        raise RuntimeError("upsert backend unavailable")
+
+
+class RaisingFetchIndexHandle(FakeIndexHandle):
+    def fetch(self, *, ids: list[str], namespace: str) -> Any:
+        raise RuntimeError("fetch backend unavailable")
+
+
+class FakeDocumentEmbeddings:
+    """Fake OpenAIEmbeddings-like client for embed_documents batches."""
+
+    def __init__(self, embeddings_by_text: dict[str, list[float]] | None = None) -> None:
+        self._embeddings_by_text = embeddings_by_text
+        self.embed_documents_calls: list[list[str]] = []
+
+    def embed_query(self, text: str) -> list[float]:
+        raise AssertionError("embed_query must not be used for document chunks")
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.embed_documents_calls.append(list(texts))
+        if self._embeddings_by_text is not None:
+            return [self._embeddings_by_text[text] for text in texts]
+        return [[float(len(text))] * 1536 for text in texts]
+
+
+class ScriptedDocumentEmbeddings:
+    """Returns a fixed, preconfigured embed_documents result regardless of input."""
+
+    def __init__(self, embeddings: list[list[Any]]) -> None:
+        self._embeddings = embeddings
+        self.embed_documents_calls: list[list[str]] = []
+
+    def embed_query(self, text: str) -> list[float]:
+        raise AssertionError("embed_query must not be used for document chunks")
+
+    def embed_documents(self, texts: list[str]) -> list[list[Any]]:
+        self.embed_documents_calls.append(list(texts))
+        return self._embeddings
+
+
+class RaisingDocumentEmbeddings:
+    def embed_query(self, text: str) -> list[float]:
+        raise AssertionError("embed_query must not be used for document chunks")
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("embedding backend unavailable")
 
 
 class FakePineconeClient:
@@ -114,8 +213,12 @@ class FakePineconeClient:
         self._describe_calls = 0
         self.created: dict[str, Any] | None = None
         self.index_handle: FakeIndexHandle = FakeIndexHandle(visible_after=visible_after)
+        self.has_index_call_count = 0
+        self.describe_index_call_count = 0
+        self.index_call_count = 0
 
     def has_index(self, name: str) -> bool:
+        self.has_index_call_count += 1
         return self.existing
 
     def describe_index(self, name: str) -> Any:
@@ -123,6 +226,7 @@ class FakePineconeClient:
             raise AssertionError("describe_index called with no descriptions configured")
         index = min(self._describe_calls, len(self._descriptions) - 1)
         self._describe_calls += 1
+        self.describe_index_call_count += 1
         return self._descriptions[index]
 
     def create_index(self, *, name: str, dimension: int, metric: str, spec: Any) -> None:
@@ -136,6 +240,7 @@ class FakePineconeClient:
         self.existing = True
 
     def Index(self, name: str) -> FakeIndexHandle:  # noqa: N802 - matches Pinecone SDK
+        self.index_call_count += 1
         return self.index_handle
 
 
@@ -415,3 +520,583 @@ def test_index_not_found_error_does_not_leak_secrets() -> None:
     message = str(exc_info.value)
     assert "sk-super-secret" not in message
     assert "pc-super-secret" not in message
+
+
+# --- embed_documents --------------------------------------------------------
+
+
+def test_embed_documents_single_batch_preserves_order_and_values() -> None:
+    embeddings_by_text = {
+        "alpha": [0.1] * 1536,
+        "beta": [0.2] * 1536,
+    }
+    embeddings = FakeDocumentEmbeddings(embeddings_by_text)
+    settings = make_settings()
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    result = store.embed_documents(["alpha", "beta"])
+
+    assert result == [embeddings_by_text["alpha"], embeddings_by_text["beta"]]
+    assert embeddings.embed_documents_calls == [["alpha", "beta"]]
+
+
+def test_embed_documents_empty_input_returns_empty_and_skips_call() -> None:
+    embeddings = FakeDocumentEmbeddings()
+    settings = make_settings()
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    result = store.embed_documents([])
+
+    assert result == []
+    assert embeddings.embed_documents_calls == []
+
+
+def test_embed_documents_rejects_count_mismatch() -> None:
+    embeddings = ScriptedDocumentEmbeddings([[0.1] * 1536])
+    settings = make_settings()
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_documents(["alpha", "beta"])
+
+
+def test_embed_documents_rejects_dimension_mismatch() -> None:
+    embeddings = ScriptedDocumentEmbeddings([[0.1] * 10])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_documents(["alpha"])
+
+
+def test_embed_documents_rejects_non_numeric_value() -> None:
+    embeddings = ScriptedDocumentEmbeddings([[0.1] * 1535 + ["not-a-number"]])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_documents(["alpha"])
+
+
+def test_embed_documents_rejects_nan_value() -> None:
+    embeddings = ScriptedDocumentEmbeddings([[0.1] * 1535 + [float("nan")]])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_documents(["alpha"])
+
+
+def test_embed_documents_rejects_infinite_value() -> None:
+    embeddings = ScriptedDocumentEmbeddings([[0.1] * 1535 + [float("inf")]])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_documents(["alpha"])
+
+
+def test_embed_documents_rejects_boolean_true_value() -> None:
+    embeddings = ScriptedDocumentEmbeddings([[0.1] * 1535 + [True]])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_documents(["alpha"])
+
+
+def test_embed_documents_rejects_boolean_false_value() -> None:
+    embeddings = ScriptedDocumentEmbeddings([[0.1] * 1535 + [False]])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_documents(["alpha"])
+
+
+def test_embed_documents_accepts_plain_int_and_float_values() -> None:
+    embeddings = ScriptedDocumentEmbeddings([[0, 1, 2]])
+    settings = make_settings(pinecone_dimension=3)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    result = store.embed_documents(["alpha"])
+
+    assert result == [[0.0, 1.0, 2.0]]
+
+
+def test_embed_documents_wraps_openai_failure_with_cause() -> None:
+    settings = make_settings()
+    store = PineconeStore(settings, embeddings=RaisingDocumentEmbeddings())
+
+    with pytest.raises(PineconeEmbeddingError) as exc_info:
+        store.embed_documents(["alpha"])
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_embed_documents_error_does_not_leak_secrets() -> None:
+    settings = make_settings(
+        openai_api_key="sk-super-secret", pinecone_api_key="pc-super-secret"
+    )
+    store = PineconeStore(settings, embeddings=RaisingDocumentEmbeddings())
+
+    with pytest.raises(PineconeEmbeddingError) as exc_info:
+        store.embed_documents(["alpha"])
+
+    message = str(exc_info.value)
+    assert "sk-super-secret" not in message
+    assert "pc-super-secret" not in message
+
+
+# --- upsert_vectors ----------------------------------------------------------
+
+
+def _make_record(record_id: str = "doc-1-chunk-0000") -> dict[str, Any]:
+    return {
+        "id": record_id,
+        "values": [0.1, 0.2, 0.3],
+        "metadata": {"kind": "documentation_chunk", "text": "hello"},
+    }
+
+
+def test_upsert_vectors_sends_exact_ids_metadata_values_and_namespace() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+    record = _make_record()
+
+    upserted = store.upsert_vectors([record], namespace="documentation")
+
+    assert upserted == 1
+    assert client.index_handle.upserted == [
+        {"vectors": [record], "namespace": "documentation"}
+    ]
+
+
+def test_upsert_vectors_calls_ensure_index_first() -> None:
+    client = FakePineconeClient(existing=False)
+    settings = make_settings(pinecone_create_if_missing=False)
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeIndexNotFoundError):
+        store.upsert_vectors([_make_record()], namespace="documentation")
+
+    assert client.index_handle.upserted == []
+
+
+def test_upsert_vectors_empty_input_returns_zero_and_skips_network() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    upserted = store.upsert_vectors([], namespace="documentation")
+
+    assert upserted == 0
+    assert client.index_handle.upserted == []
+
+
+def test_upsert_vectors_reads_count_from_object_response() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response=SimpleNamespace(upserted_count=1))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    upserted = store.upsert_vectors(
+        [_make_record(), _make_record("doc-1-chunk-0001")], namespace="documentation"
+    )
+
+    assert upserted == 1
+
+
+def test_upsert_vectors_reads_count_from_mapping_response() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response={"upserted_count": 2})
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    upserted = store.upsert_vectors([_make_record()], namespace="documentation")
+
+    assert upserted == 2
+
+
+def test_upsert_vectors_returns_count_even_when_higher_than_batch_size() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response={"upserted_count": 5})
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    upserted = store.upsert_vectors([_make_record()], namespace="documentation")
+
+    assert upserted == 5
+
+
+def test_upsert_vectors_returns_count_even_when_lower_than_batch_size() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response={"upserted_count": 0})
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    upserted = store.upsert_vectors(
+        [_make_record(), _make_record("doc-1-chunk-0001")], namespace="documentation"
+    )
+
+    assert upserted == 0
+
+
+def test_upsert_vectors_rejects_missing_upserted_count_field() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response=SimpleNamespace())
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeUpsertError):
+        store.upsert_vectors([_make_record()], namespace="documentation")
+
+
+def test_upsert_vectors_rejects_none_upserted_count() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response={"upserted_count": None})
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeUpsertError):
+        store.upsert_vectors([_make_record()], namespace="documentation")
+
+
+def test_upsert_vectors_rejects_boolean_upserted_count() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response={"upserted_count": True})
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeUpsertError):
+        store.upsert_vectors([_make_record()], namespace="documentation")
+
+
+def test_upsert_vectors_rejects_string_upserted_count() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response={"upserted_count": "1"})
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeUpsertError):
+        store.upsert_vectors([_make_record()], namespace="documentation")
+
+
+def test_upsert_vectors_rejects_float_upserted_count() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response={"upserted_count": 1.0})
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeUpsertError):
+        store.upsert_vectors([_make_record()], namespace="documentation")
+
+
+def test_upsert_vectors_rejects_negative_upserted_count() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response={"upserted_count": -1})
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeUpsertError):
+        store.upsert_vectors([_make_record()], namespace="documentation")
+
+
+def test_upsert_vectors_strict_parsing_error_does_not_leak_secrets() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(upsert_response=SimpleNamespace())
+    settings = make_settings(
+        openai_api_key="sk-super-secret", pinecone_api_key="pc-super-secret"
+    )
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeUpsertError) as exc_info:
+        store.upsert_vectors([_make_record()], namespace="documentation")
+
+    message = str(exc_info.value)
+    assert "sk-super-secret" not in message
+    assert "pc-super-secret" not in message
+
+
+def test_upsert_vectors_wraps_sdk_error_with_cause() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = RaisingUpsertIndexHandle()
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeUpsertError) as exc_info:
+        store.upsert_vectors([_make_record()], namespace="documentation")
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+# --- fetch_existing_ids -------------------------------------------------------
+
+
+def test_fetch_existing_ids_returns_exact_found_ids() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+    store.upsert_vectors([_make_record("a"), _make_record("b")], namespace="documentation")
+
+    found = store.fetch_existing_ids(["a", "b", "c"], namespace="documentation")
+
+    assert found == {"a", "b"}
+    assert client.index_handle.fetch_calls == [
+        {"ids": ["a", "b", "c"], "namespace": "documentation"}
+    ]
+
+
+def test_fetch_existing_ids_empty_input_returns_empty_and_skips_network() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    found = store.fetch_existing_ids([], namespace="documentation")
+
+    assert found == set()
+    assert client.index_handle.fetch_calls == []
+
+
+def test_fetch_existing_ids_calls_ensure_index_first() -> None:
+    client = FakePineconeClient(existing=False)
+    settings = make_settings(pinecone_create_if_missing=False)
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeIndexNotFoundError):
+        store.fetch_existing_ids(["a"], namespace="documentation")
+
+
+def test_fetch_existing_ids_wraps_sdk_error_with_cause() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = RaisingFetchIndexHandle()
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeFetchError) as exc_info:
+        store.fetch_existing_ids(["a"], namespace="documentation")
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_fetch_existing_ids_supports_object_vectors_mapping() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(
+        fetch_response=SimpleNamespace(vectors={"a": SimpleNamespace(id="a")})
+    )
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    found = store.fetch_existing_ids(["a", "b"], namespace="documentation")
+
+    assert found == {"a"}
+
+
+def test_fetch_existing_ids_supports_mapping_response() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(fetch_response={"vectors": {"a": {"id": "a"}}})
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    found = store.fetch_existing_ids(["a"], namespace="documentation")
+
+    assert found == {"a"}
+
+
+def test_fetch_existing_ids_accepts_empty_vectors_mapping() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(fetch_response=SimpleNamespace(vectors={}))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    found = store.fetch_existing_ids(["a"], namespace="documentation")
+
+    assert found == set()
+
+
+def test_fetch_existing_ids_rejects_missing_vectors_field() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(fetch_response=SimpleNamespace())
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeFetchError):
+        store.fetch_existing_ids(["a"], namespace="documentation")
+
+
+def test_fetch_existing_ids_rejects_none_vectors_field() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(fetch_response=SimpleNamespace(vectors=None))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeFetchError):
+        store.fetch_existing_ids(["a"], namespace="documentation")
+
+
+def test_fetch_existing_ids_rejects_list_vectors_field() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(
+        fetch_response=SimpleNamespace(vectors=[SimpleNamespace(id="a")])
+    )
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeFetchError):
+        store.fetch_existing_ids(["a"], namespace="documentation")
+
+
+def test_fetch_existing_ids_rejects_non_string_key() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(
+        fetch_response=SimpleNamespace(vectors={1: SimpleNamespace(id=1)})
+    )
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeFetchError):
+        store.fetch_existing_ids(["a"], namespace="documentation")
+
+
+def test_fetch_existing_ids_strict_parsing_error_does_not_leak_secrets() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(fetch_response=SimpleNamespace())
+    settings = make_settings(
+        openai_api_key="sk-super-secret", pinecone_api_key="pc-super-secret"
+    )
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeFetchError) as exc_info:
+        store.fetch_existing_ids(["a"], namespace="documentation")
+
+    message = str(exc_info.value)
+    assert "sk-super-secret" not in message
+    assert "pc-super-secret" not in message
+
+
+# --- delete_vectors_by_filter -------------------------------------------------
+
+
+def test_delete_vectors_by_filter_uses_exact_filter_and_namespace() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+    metadata_filter = {
+        "$and": [
+            {"source_url": {"$eq": "https://docs.example.com/page"}},
+            {"content_hash": {"$ne": "hash-value"}},
+        ]
+    }
+
+    store.delete_vectors_by_filter(metadata_filter, namespace="documentation")
+
+    assert client.index_handle.deleted == [
+        {"filter": metadata_filter, "namespace": "documentation"}
+    ]
+
+
+def test_delete_vectors_by_filter_does_not_pass_ids() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    store.delete_vectors_by_filter({"source_url": {"$eq": "x"}}, namespace="documentation")
+
+    assert "ids" not in client.index_handle.deleted[0]
+
+
+def test_delete_vectors_by_filter_calls_ensure_index_first() -> None:
+    client = FakePineconeClient(existing=False)
+    settings = make_settings(pinecone_create_if_missing=False)
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeIndexNotFoundError):
+        store.delete_vectors_by_filter({"source_url": {"$eq": "x"}}, namespace="documentation")
+
+
+def test_delete_vectors_by_filter_wraps_sdk_error_with_cause() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FailingDeleteIndexHandle()
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeDeleteError) as exc_info:
+        store.delete_vectors_by_filter({"source_url": {"$eq": "x"}}, namespace="documentation")
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+# --- cached ready index handle -------------------------------------------------
+
+
+def test_data_plane_calls_share_one_cached_ready_handle() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    store.upsert_vectors([_make_record("a")], namespace="documentation")
+    store.upsert_vectors([_make_record("b")], namespace="documentation")
+    store.fetch_existing_ids(["a"], namespace="documentation")
+    store.delete_vectors_by_filter({"source_url": {"$eq": "x"}}, namespace="documentation")
+
+    assert client.has_index_call_count == 1
+    assert client.describe_index_call_count == 1
+    assert client.index_call_count == 1
+
+
+def test_embed_documents_never_touches_pinecone_client() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    embeddings = FakeDocumentEmbeddings()
+    settings = make_settings()
+    store = PineconeStore(settings, client=client, embeddings=embeddings)
+
+    store.embed_documents(["alpha", "beta"])
+
+    assert client.has_index_call_count == 0
+    assert client.describe_index_call_count == 0
+    assert client.index_call_count == 0
+
+
+class FlakyUpsertIndexHandle(FakeIndexHandle):
+    """Raises on its Nth upsert call (1-indexed); succeeds on every other call."""
+
+    def __init__(self, *, fail_on_call: int) -> None:
+        super().__init__()
+        self._fail_on_call = fail_on_call
+        self._calls = 0
+
+    def upsert(self, *, vectors: list[dict[str, Any]], namespace: str) -> Any:
+        self._calls += 1
+        if self._calls == self._fail_on_call:
+            raise RuntimeError("transient upsert failure")
+        return super().upsert(vectors=vectors, namespace=namespace)
+
+
+def test_data_plane_failure_invalidates_cache_and_next_call_recovers() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FlakyUpsertIndexHandle(fail_on_call=2)
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    store.upsert_vectors([_make_record("a")], namespace="documentation")
+    assert client.index_call_count == 1
+
+    with pytest.raises(PineconeUpsertError):
+        store.upsert_vectors([_make_record("b")], namespace="documentation")
+
+    store.upsert_vectors([_make_record("c")], namespace="documentation")
+
+    assert client.index_call_count == 2
+
+
+def test_separate_store_instances_do_not_share_cached_handle() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store_one = PineconeStore(settings, client=client)
+    store_two = PineconeStore(settings, client=client)
+
+    store_one.upsert_vectors([_make_record("a")], namespace="documentation")
+    store_two.upsert_vectors([_make_record("b")], namespace="documentation")
+
+    assert client.index_call_count == 2

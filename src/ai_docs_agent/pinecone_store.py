@@ -1,8 +1,9 @@
 """Pinecone index management and an OpenAI-embedding integration smoke test."""
 
+import math
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
 from langchain_openai import OpenAIEmbeddings
@@ -30,10 +31,28 @@ class PineconeSmokeTestError(PineconeStoreError):
     """Raised when the embed -> upsert -> query smoke test pipeline fails."""
 
 
+class PineconeEmbeddingError(PineconeStoreError):
+    """Raised when creating or validating document embeddings fails."""
+
+
+class PineconeUpsertError(PineconeStoreError):
+    """Raised when upserting vectors into Pinecone fails."""
+
+
+class PineconeFetchError(PineconeStoreError):
+    """Raised when fetching vectors from Pinecone fails."""
+
+
+class PineconeDeleteError(PineconeStoreError):
+    """Raised when deleting vectors from Pinecone by metadata filter fails."""
+
+
 class EmbeddingsClient(Protocol):
     """Structural interface for the embedding client used by PineconeStore."""
 
     def embed_query(self, text: str) -> list[float]: ...
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
 
 
 class PineconeClient(Protocol):
@@ -67,6 +86,7 @@ class PineconeStore:
         self._embeddings = embeddings
         self._clock = clock
         self._sleep = sleep
+        self._ready_index_handle: Any | None = None
 
     @property
     def _pinecone_client(self) -> PineconeClient:
@@ -142,6 +162,164 @@ class PineconeStore:
             cleanup_succeeded=cleanup_succeeded,
             elapsed_seconds=elapsed,
         )
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        """Create OpenAI embeddings for a batch of document chunk texts, preserving order."""
+        if not texts:
+            return []
+
+        try:
+            raw_embeddings = self._embedding_client.embed_documents(list(texts))
+        except Exception as exc:
+            raise PineconeEmbeddingError("Failed to create document embeddings.") from exc
+
+        if len(raw_embeddings) != len(texts):
+            raise PineconeEmbeddingError(
+                f"Received {len(raw_embeddings)} embedding(s) for {len(texts)} text(s)."
+            )
+
+        expected_dimension = self._settings.pinecone_dimension
+        return [
+            self._validate_embedding_values(embedding, expected_dimension)
+            for embedding in raw_embeddings
+        ]
+
+    @staticmethod
+    def _validate_embedding_values(
+        embedding: Sequence[Any], expected_dimension: int
+    ) -> list[float]:
+        if len(embedding) != expected_dimension:
+            raise PineconeEmbeddingError(
+                f"Embedding dimension {len(embedding)} does not match configured "
+                f"index dimension {expected_dimension}."
+            )
+
+        values: list[float] = []
+        for raw_value in embedding:
+            if isinstance(raw_value, bool):
+                raise PineconeEmbeddingError(
+                    "Embedding contains a boolean value, which is not a valid "
+                    "embedding component."
+                )
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise PineconeEmbeddingError(
+                    "Embedding contains a non-numeric value."
+                ) from exc
+            if math.isnan(value) or math.isinf(value):
+                raise PineconeEmbeddingError("Embedding contains a NaN or infinite value.")
+            values.append(value)
+        return values
+
+    def upsert_vectors(
+        self, vectors: Sequence[dict[str, object]], *, namespace: str
+    ) -> int:
+        """Upsert a batch of already-embedded vectors and return the confirmed count."""
+        if not vectors:
+            return 0
+
+        index = self._get_ready_index_handle()
+        try:
+            response = index.upsert(vectors=list(vectors), namespace=namespace)
+        except Exception as exc:
+            self._invalidate_ready_index_handle()
+            raise PineconeUpsertError("Failed to upsert vectors into Pinecone.") from exc
+
+        return self._parse_upserted_count(response)
+
+    @staticmethod
+    def _parse_upserted_count(response: Any) -> int:
+        try:
+            if isinstance(response, Mapping):
+                raw_count = response["upserted_count"]
+            else:
+                raw_count = response.upserted_count
+        except (KeyError, AttributeError) as exc:
+            raise PineconeUpsertError(
+                "Pinecone upsert response did not include an 'upserted_count' field."
+            ) from exc
+
+        if raw_count is None or isinstance(raw_count, bool) or not isinstance(raw_count, int):
+            raise PineconeUpsertError(
+                "Pinecone upsert response 'upserted_count' must be a non-negative integer."
+            )
+        if raw_count < 0:
+            raise PineconeUpsertError(
+                "Pinecone upsert response 'upserted_count' must be a non-negative integer."
+            )
+        return raw_count
+
+    def fetch_existing_ids(self, ids: Sequence[str], *, namespace: str) -> set[str]:
+        """Return the subset of `ids` that already exist in the configured index/namespace."""
+        if not ids:
+            return set()
+
+        index = self._get_ready_index_handle()
+        try:
+            response = index.fetch(ids=list(ids), namespace=namespace)
+        except Exception as exc:
+            self._invalidate_ready_index_handle()
+            raise PineconeFetchError("Failed to fetch vectors from Pinecone.") from exc
+
+        return self._extract_fetched_ids(response)
+
+    @staticmethod
+    def _extract_fetched_ids(response: Any) -> set[str]:
+        try:
+            if isinstance(response, Mapping):
+                vectors = response["vectors"]
+            else:
+                vectors = response.vectors
+        except (KeyError, AttributeError) as exc:
+            raise PineconeFetchError(
+                "Pinecone fetch response did not include a 'vectors' field."
+            ) from exc
+
+        if vectors is None:
+            raise PineconeFetchError("Pinecone fetch response 'vectors' field was None.")
+        if not isinstance(vectors, Mapping):
+            raise PineconeFetchError(
+                "Pinecone fetch response 'vectors' field must be a mapping of ID to vector."
+            )
+
+        ids: set[str] = set()
+        for key in vectors:
+            if not isinstance(key, str):
+                raise PineconeFetchError(
+                    "Pinecone fetch response 'vectors' mapping contained a non-string ID key."
+                )
+            ids.add(key)
+        return ids
+
+    def delete_vectors_by_filter(
+        self, metadata_filter: dict[str, object], *, namespace: str
+    ) -> None:
+        """Delete every vector in `namespace` that matches a metadata filter."""
+        index = self._get_ready_index_handle()
+        try:
+            index.delete(filter=dict(metadata_filter), namespace=namespace)
+        except Exception as exc:
+            self._invalidate_ready_index_handle()
+            raise PineconeDeleteError(
+                "Failed to delete vectors from Pinecone by filter."
+            ) from exc
+
+    def _get_ready_index_handle(self) -> Any:
+        """Return a cached, ready Pinecone index handle for this store instance.
+
+        Control-plane readiness (`ensure_index()`) is checked at most once per
+        store instance for the data-plane methods (upsert/fetch/delete); the
+        handle is re-fetched only after a data-plane call fails, since that may
+        indicate the cached handle (e.g. its host) is no longer valid.
+        """
+        if self._ready_index_handle is None:
+            self.ensure_index()
+            self._ready_index_handle = self._get_index_handle()
+        return self._ready_index_handle
+
+    def _invalidate_ready_index_handle(self) -> None:
+        self._ready_index_handle = None
 
     def _create_smoke_embedding(self, expected_dimension: int) -> list[float]:
         try:

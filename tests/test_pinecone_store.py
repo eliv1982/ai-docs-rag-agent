@@ -25,6 +25,7 @@ _AUTO = object()
 _REQUIRED: dict[str, Any] = {
     "openai_api_key": "sk-test-openai",
     "pinecone_api_key": "pc-test-key",
+    "openai_chat_model": "gpt-4o-mini",
 }
 
 

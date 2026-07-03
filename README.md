@@ -4,8 +4,9 @@ Telegram RAG-агент для работы с технической докум
 
 **Статус: typed configuration + Pinecone index management/smoke-test + URL ingestion/chunking
 + URL indexing into Pinecone (fetch → embeddings → upsert → verify → cleanup) + typed
-read-only semantic search (`RetrievalService.search`) implemented. RAG generation, agent/tools
-и Telegram-интерфейс ещё не реализованы.**
+read-only semantic search (`RetrievalService.search`) + minimal grounded RAG answering
+(`DocumentationAnswerService.answer`) implemented. Conversation memory, agent/tools и
+Telegram-интерфейс ещё не реализованы.**
 
 ## Планируемые возможности
 
@@ -23,9 +24,10 @@ read-only semantic search (`RetrievalService.search`) implemented. RAG generatio
 ## Архитектурный статус
 
 Реализованы: URL ingestion, HTML parsing, чанкинг, создание embeddings и запись чанков в
-Pinecone (`DocumentIndexingService.index_url`), а также типизированный read-only
-семантический поиск по уже проиндексированным чанкам (`RetrievalService.search`, см. ниже).
-Генерация ответов через LLM, LangChain agent, tools и Telegram-интерфейс пока не реализованы.
+Pinecone (`DocumentIndexingService.index_url`), типизированный read-only семантический поиск
+по уже проиндексированным чанкам (`RetrievalService.search`, см. ниже), а также минимальный
+grounded RAG answering поверх retrieval (`DocumentationAnswerService.answer`, см. ниже).
+Разговорная память, LangChain agent, tools и Telegram-интерфейс пока не реализованы.
 
 На данном этапе реализовано:
 
@@ -41,12 +43,14 @@ Pinecone (`DocumentIndexingService.index_url`), а также типизиров
   fetch-verification → удаление устаревших версий той же страницы;
 - типизированный read-only семантический поиск (`RetrievalService.search`): query text →
   OpenAI query embedding → Pinecone similarity query → строго провалидированные
-  `RetrievedChunk` (см. ниже).
+  `RetrievedChunk` (см. ниже);
+- минимальный grounded RAG answering (`DocumentationAnswerService.answer`): question →
+  `RetrievalService.search` → grounded LLM prompt → одна text-ответ chat completion →
+  `GroundedAnswerResult` с детерминированным списком источников (см. ниже).
 
-Остальные модули (`memory.py`, `tools.py`, `agent.py`, `telegram_bot.py`) по-прежнему
-содержат только module docstring. **RAG generation (сборка промпта и генерация ответа через
-LLM), пользовательские citations, agent orchestration, tools, память и Telegram-интерфейс
-ещё не реализованы** — retrieval лишь находит и типизирует релевантные чанки.
+Остальные модули (`memory.py`, `tools.py`, `telegram_bot.py`) по-прежнему содержат только
+module docstring. **Разговорная память (conversation memory), agent orchestration, tools
+(включая PyPI GET API tool) и Telegram-интерфейс ещё не реализованы.**
 
 ### URL ingestion и chunking pipeline
 
@@ -239,6 +243,64 @@ python scripts/search_query.py "how do I configure the client?"
 python scripts/search_query.py "how do I configure the client?" --top-k 3 --namespace documentation
 ```
 
+### Grounded RAG answering
+
+`src/ai_docs_agent/agent.py` определяет `DocumentationAnswerService.answer(question, *,
+top_k=None, namespace=None) -> GroundedAnswerResult`, реализующий минимальный grounded
+answering pipeline:
+
+```
+question → RetrievalService.search() → retrieved RetrievedChunk[] →
+компактный grounded system+user prompt (текст чанков — untrusted data, не instructions) →
+один plain-text chat completion (OpenAI Chat Completions API) →
+GroundedAnswerResult { answer, sources, retrieved_chunk_count }
+```
+
+Сервис переиспользует `RetrievalService` (не дублирует retrieval-логику или обязательный
+`documentation_chunk` filter) и принимает chat-клиент через dependency injection
+(`ChatClient` protocol; production-реализация — `OpenAIChatClient`, тонкая обёртка над
+установленным `openai` SDK, `chat.completions.create`). Конструктор сервиса и импорт модуля
+не выполняют сетевых вызовов.
+
+**Источники — из метаданных, не от модели.** `AnswerSource` строится напрямую из
+`RetrievedChunk` (`title`, `final_url`/`source_url`, `document_id`, `chunk_index`,
+`chunk_count`) — модель никогда не генерирует URL или список источников сама; промпт прямо
+запрещает придумывать источники. Источники сохраняют порядок первого появления и
+дедуплицируются по итоговому URL (несколько чанков одной страницы → один источник); это
+document-level источники, не claim-level citations (не привязаны к конкретному предложению
+ответа).
+
+**Fallback без контекста.** Если `RetrievalService.search()` не вернул ни одного чанка, chat
+model не вызывается вообще — сервис детерминированно возвращает `GroundedAnswerResult` с
+`retrieved_chunk_count=0`, пустым `sources` и фиксированным текстом:
+
+```
+В базе знаний не найдено достаточно информации для ответа на этот вопрос.
+```
+
+**Ошибки.** `AnswerRetrievalError` — сбой на этапе `RetrievalService.search()` (embedding/
+query/malformed metadata); `AnswerGenerationError` — сбой chat-клиента **или** пустой/
+whitespace-only ответ модели. Оба наследуются от `AnswerServiceError`; исходное исключение
+сохраняется в `__cause__`, публичное сообщение не содержит ключей/секретов/сырых деталей
+исключения.
+
+**Известное ограничение grounding'а (best-effort, не гарантия).** Grounding в текущем MVP
+обеспечивается только промптом (`_SYSTEM_PROMPT` явно требует closed-book-ответ строго по
+предоставленному контексту и запрещает домысливать) и содержимым retrieved-чанков — отдельной
+верификации фактов нет. Так как генерация — это один свободный (free-form) LLM-вызов без
+structured output, модель иногда может добавить правдоподобную, но не подтверждённую явно в
+контексте деталь из своих pretrained-знаний (это наблюдалось на живой проверке). Детерминированная
+claim-level верификация фактов, structured citations или дополнительный verification pass
+(второй LLM-вызов/critic model) не реализованы и отнесены к будущим версиям.
+
+Задать вопрос по индексу (live, требует реальных OpenAI/Pinecone ключей; строго read-only —
+не выполняет upsert/delete/переиндексацию):
+
+```
+python scripts/ask_docs.py "how do I configure the client?"
+python scripts/ask_docs.py "how do I configure the client?" --top-k 3 --namespace documentation
+```
+
 ### Typed configuration
 
 `src/ai_docs_agent/config.py` определяет `AppSettings` (pydantic-settings): загружает
@@ -275,11 +337,13 @@ region. Существующий индекс никогда не пересоз
   `tests/test_pinecone_smoke_script.py`, `tests/test_url_ingestion.py`,
   `tests/test_url_preview_script.py`, `tests/test_indexing.py`,
   `tests/test_index_url_script.py`, `tests/test_retrieval.py`,
-  `tests/test_search_query_script.py`) — быстрые unit-тесты на fake-объектах, без сети, без
+  `tests/test_search_query_script.py`, `tests/test_agent.py`,
+  `tests/test_ask_docs_script.py`) — быстрые unit-тесты на fake-объектах, без сети, без
   реального DNS, без реальных ключей, без реальных задержек. HTTP fake'ается через
   `httpx.MockTransport`, DNS — через injectable resolver, Pinecone/OpenAI — через
-  dependency-injection-friendly fakes (`DocumentIndexingService`, `RetrievalService` и
-  `PineconeStore` принимают fake-сервисы/клиенты и injectable clock/sleep).
+  dependency-injection-friendly fakes (`DocumentIndexingService`, `RetrievalService`,
+  `DocumentationAnswerService` и `PineconeStore` принимают fake-сервисы/клиенты и injectable
+  clock/sleep).
 - `scripts/pinecone_smoke_test.py` — **live**-скрипт, выполняющий реальные вызовы OpenAI и
   Pinecone. Требует настоящих `OPENAI_API_KEY` и `PINECONE_API_KEY` и создаёт/удаляет один
   реальный вектор в Pinecone. Не запускается автоматически и не входит в тестовый набор.
@@ -302,6 +366,12 @@ region. Существующий индекс никогда не пересоз
   тестируется только чистая функция форматирования (`format_search_report`) и `main()` с
   внедрённым fake-сервисом. Exit codes: `0` — поиск успешен (в т.ч. с пустым результатом);
   `1` — домен/выполнение.
+- `scripts/ask_docs.py` — **live**-скрипт, выполняющий реальные вызовы OpenAI (query
+  embedding + chat completion) и Pinecone (query). Строго read-only: никогда не выполняет
+  upsert/delete/переиндексацию. Требует настоящих ключей, не входит в автоматический
+  тестовый набор; тестируется только чистая функция форматирования (`format_answer_report`)
+  и `main()` с внедрённым fake-сервисом. Exit code `0` — ответ получен успешно (в т.ч.
+  fallback без контекста); `1` — домен/выполнение.
 
 ## Требования
 
@@ -375,6 +445,30 @@ python scripts/index_url.py "https://example.com/docs" --namespace documentation
 python scripts/search_query.py "how do I configure the client?"
 python scripts/search_query.py "how do I configure the client?" --top-k 3 --namespace documentation
 ```
+
+## Grounded RAG answering (live, read-only, требует реальных OpenAI/Pinecone ключей)
+
+```
+python scripts/ask_docs.py "how do I configure the client?"
+python scripts/ask_docs.py "how do I configure the client?" --top-k 3 --namespace documentation
+```
+
+## Planned improvements / Следующая версия
+
+Текущие ограничения этого этапа (Stage 4C — minimal grounded RAG answering):
+
+- нет разговорной памяти (conversation memory) — каждый вопрос обрабатывается независимо,
+  без истории диалога;
+- нет Telegram-интерфейса;
+- нет score threshold/reranking результатов retrieval — используется порядок, возвращённый
+  Pinecone, как есть;
+- нет persistent chat history — ничего не сохраняется между вызовами;
+- источники (`AnswerSource`) — document-level ссылки (страница + чанк), а не claim-level
+  citations (не привязаны к конкретному предложению или факту в ответе модели);
+- нет детерминированной claim-level верификации фактов и structured citations, нет
+  дополнительного verification pass (второго LLM-вызова/critic model) — grounding
+  обеспечивается только промптом и retrieved-контекстом, поэтому модель иногда может
+  добавить правдоподобную, но явно не подтверждённую контекстом деталь.
 
 ## Безопасность
 

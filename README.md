@@ -5,8 +5,9 @@ Telegram RAG-агент для работы с технической докум
 **Статус: typed configuration + Pinecone index management/smoke-test + URL ingestion/chunking
 + URL indexing into Pinecone (fetch → embeddings → upsert → verify → cleanup) + typed
 read-only semantic search (`RetrievalService.search`) + minimal grounded RAG answering
-(`DocumentationAnswerService.answer`) implemented. Conversation memory, agent/tools и
-Telegram-интерфейс ещё не реализованы.**
+(`DocumentationAnswerService.answer`) + short-term in-memory conversation memory
+(`ConversationAnswerService`) implemented. Agent/tools и Telegram-интерфейс ещё не
+реализованы.**
 
 ## Планируемые возможности
 
@@ -25,9 +26,11 @@ Telegram-интерфейс ещё не реализованы.**
 
 Реализованы: URL ingestion, HTML parsing, чанкинг, создание embeddings и запись чанков в
 Pinecone (`DocumentIndexingService.index_url`), типизированный read-only семантический поиск
-по уже проиндексированным чанкам (`RetrievalService.search`, см. ниже), а также минимальный
-grounded RAG answering поверх retrieval (`DocumentationAnswerService.answer`, см. ниже).
-Разговорная память, LangChain agent, tools и Telegram-интерфейс пока не реализованы.
+по уже проиндексированным чанкам (`RetrievalService.search`, см. ниже), минимальный
+grounded RAG answering поверх retrieval (`DocumentationAnswerService.answer`, см. ниже), а
+также короткая process-local разговорная память по `session_id`
+(`ConversationAnswerService`, см. ниже). LangChain agent, tools и Telegram-интерфейс пока не
+реализованы.
 
 На данном этапе реализовано:
 
@@ -46,11 +49,14 @@ grounded RAG answering поверх retrieval (`DocumentationAnswerService.answe
   `RetrievedChunk` (см. ниже);
 - минимальный grounded RAG answering (`DocumentationAnswerService.answer`): question →
   `RetrievalService.search` → grounded LLM prompt → одна text-ответ chat completion →
-  `GroundedAnswerResult` с детерминированным списком источников (см. ниже).
+  `GroundedAnswerResult` с детерминированным списком источников (см. ниже);
+- короткая process-local разговорная память по `session_id` (`ConversationAnswerService`,
+  `InMemoryConversationMemory`, см. ниже): последние сообщения диалога подставляются в промпт
+  для continuity, но никогда не считаются документальным фактом.
 
-Остальные модули (`memory.py`, `tools.py`, `telegram_bot.py`) по-прежнему содержат только
-module docstring. **Разговорная память (conversation memory), agent orchestration, tools
-(включая PyPI GET API tool) и Telegram-интерфейс ещё не реализованы.**
+Остальные модули (`tools.py`, `telegram_bot.py`) по-прежнему содержат только module
+docstring. **Agent orchestration, tools (включая PyPI GET API tool) и Telegram-интерфейс
+ещё не реализованы.**
 
 ### URL ingestion и chunking pipeline
 
@@ -301,6 +307,53 @@ python scripts/ask_docs.py "how do I configure the client?"
 python scripts/ask_docs.py "how do I configure the client?" --top-k 3 --namespace documentation
 ```
 
+### Conversation memory
+
+`src/ai_docs_agent/memory.py` определяет короткую, **process-local** разговорную память,
+изолированную по `session_id`:
+
+- `InMemoryConversationMemory` — обычный `dict[str, list[ConversationMessage]]` в памяти
+  процесса: хранит **последние 10** сообщений (`user`/`assistant`) на сессию, старые
+  сообщения при превышении лимита отбрасываются первыми (FIFO); `get_history()` возвращает
+  неизменяемый `tuple[ConversationMessage, ...]` (снимок, а не живую ссылку на внутренний
+  список), сессии друг от друга полностью изолированы, `clear(session_id)` удаляет только
+  одну сессию;
+- `ConversationAnswerService` — тонкая обёртка вокруг `DocumentationAnswerService`: читает
+  историю сессии → вызывает `answer(question, history=..., ...)` → **только при успешном
+  результате** добавляет в память нормализованный вопрос и полученный ответ. Если retrieval
+  или генерация упали с ошибкой, память сессии остаётся без изменений; fallback-ответ
+  "нет данных в базе" — успешный результат и тоже сохраняется в историю.
+
+**Память — process-local и не переживает перезапуск процесса.** Это намеренное ограничение
+MVP для этого этапа домашнего задания: ничего не пишется на диск/в БД/по сети. Персистентное
+хранилище (например, SQLite) — запланированное улучшение v2 (см. "Planned improvements"
+ниже).
+
+**История помогает разрешать ссылки, но не является источником фактов.** История диалога
+подставляется в промпт только чтобы помочь модели понять, к чему относятся слова вида "он"/
+"эта библиотека", и сохранить continuity между репликами. Промпт явно требует не считать
+факт, упомянутый только в истории (а не в retrieved-чанках), подтверждённым документальным
+фактом; retrieved-чанки остаются единственным источником фактов для ответа. История (как и
+retrieved-текст) считается untrusted data и не может переопределить system-инструкции. В
+`AnswerSource`/список источников история никогда не попадает.
+
+Пример использования из Python (без сети — с fake-сервисами; для реального ответа
+`DocumentationAnswerService` должен быть сконфигурирован обычным образом, см. выше):
+
+```python
+from ai_docs_agent.agent import DocumentationAnswerService
+from ai_docs_agent.config import get_settings
+from ai_docs_agent.memory import ConversationAnswerService
+
+answer_service = DocumentationAnswerService(get_settings())
+conversation = ConversationAnswerService(answer_service)
+
+first = conversation.answer("session-123", "What is LangChain?")
+second = conversation.answer("session-123", "How do I configure it?")  # "it" resolved via history
+
+conversation.reset("session-123")  # clears only this session's history
+```
+
 ### Typed configuration
 
 `src/ai_docs_agent/config.py` определяет `AppSettings` (pydantic-settings): загружает
@@ -338,12 +391,14 @@ region. Существующий индекс никогда не пересоз
   `tests/test_url_preview_script.py`, `tests/test_indexing.py`,
   `tests/test_index_url_script.py`, `tests/test_retrieval.py`,
   `tests/test_search_query_script.py`, `tests/test_agent.py`,
-  `tests/test_ask_docs_script.py`) — быстрые unit-тесты на fake-объектах, без сети, без
-  реального DNS, без реальных ключей, без реальных задержек. HTTP fake'ается через
-  `httpx.MockTransport`, DNS — через injectable resolver, Pinecone/OpenAI — через
-  dependency-injection-friendly fakes (`DocumentIndexingService`, `RetrievalService`,
-  `DocumentationAnswerService` и `PineconeStore` принимают fake-сервисы/клиенты и injectable
-  clock/sleep).
+  `tests/test_ask_docs_script.py`, `tests/test_memory.py`) — быстрые unit-тесты на
+  fake-объектах, без сети, без реального DNS, без реальных ключей, без реальных задержек.
+  HTTP fake'ается через `httpx.MockTransport`, DNS — через injectable resolver, Pinecone/
+  OpenAI — через dependency-injection-friendly fakes (`DocumentIndexingService`,
+  `RetrievalService`, `DocumentationAnswerService` и `PineconeStore` принимают
+  fake-сервисы/клиенты и injectable clock/sleep; `ConversationAnswerService` принимает
+  fake `DocumentationAnswerService`). `InMemoryConversationMemory` не требует fake'ов —
+  это обычный in-process dict без внешних зависимостей.
 - `scripts/pinecone_smoke_test.py` — **live**-скрипт, выполняющий реальные вызовы OpenAI и
   Pinecone. Требует настоящих `OPENAI_API_KEY` и `PINECONE_API_KEY` и создаёт/удаляет один
   реальный вектор в Pinecone. Не запускается автоматически и не входит в тестовый набор.
@@ -455,14 +510,15 @@ python scripts/ask_docs.py "how do I configure the client?" --top-k 3 --namespac
 
 ## Planned improvements / Следующая версия
 
-Текущие ограничения этого этапа (Stage 4C — minimal grounded RAG answering):
+Текущие ограничения этого этапа (Stage 4D — minimal in-memory conversation memory):
 
-- нет разговорной памяти (conversation memory) — каждый вопрос обрабатывается независимо,
-  без истории диалога;
+- разговорная память (`InMemoryConversationMemory`) — **process-local и не персистентная**:
+  хранится только в памяти процесса (последние 10 сообщений на `session_id`) и полностью
+  теряется при перезапуске процесса; персистентное хранилище (например, SQLite) —
+  запланированное улучшение v2;
 - нет Telegram-интерфейса;
 - нет score threshold/reranking результатов retrieval — используется порядок, возвращённый
   Pinecone, как есть;
-- нет persistent chat history — ничего не сохраняется между вызовами;
 - источники (`AnswerSource`) — document-level ссылки (страница + чанк), а не claim-level
   citations (не привязаны к конкретному предложению или факту в ответе модели);
 - нет детерминированной claim-level верификации фактов и structured citations, нет

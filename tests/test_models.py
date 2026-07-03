@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from ai_docs_agent.models import (
     AnswerSource,
+    ConversationMessage,
     DocumentChunk,
     DocumentIndexingResult,
     GroundedAnswerResult,
@@ -557,3 +558,46 @@ def test_grounded_answer_result_is_frozen() -> None:
 def test_grounded_answer_result_rejects_extra_fields() -> None:
     with pytest.raises(ValidationError):
         make_grounded_answer_result(unexpected="field")
+
+
+# --- ConversationMessage --------------------------------------------------------
+
+
+def test_conversation_message_accepts_user_role() -> None:
+    message = ConversationMessage(role="user", content="How do I configure the client?")
+
+    assert message.role == "user"
+    assert message.content == "How do I configure the client?"
+
+
+def test_conversation_message_accepts_assistant_role() -> None:
+    message = ConversationMessage(role="assistant", content="Set the API key.")
+
+    assert message.role == "assistant"
+
+
+def test_conversation_message_rejects_invalid_role() -> None:
+    with pytest.raises(ValidationError):
+        ConversationMessage(role="system", content="You are a helpful assistant.")
+
+
+def test_conversation_message_rejects_blank_content() -> None:
+    with pytest.raises(ValidationError):
+        ConversationMessage(role="user", content="   ")
+
+
+def test_conversation_message_strips_content() -> None:
+    message = ConversationMessage(role="user", content="  hello  ")
+
+    assert message.content == "hello"
+
+
+def test_conversation_message_is_frozen() -> None:
+    message = ConversationMessage(role="user", content="hello")
+    with pytest.raises(ValidationError):
+        message.content = "mutated"  # type: ignore[misc]
+
+
+def test_conversation_message_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        ConversationMessage(role="user", content="hello", unexpected="field")

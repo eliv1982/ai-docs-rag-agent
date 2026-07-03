@@ -12,7 +12,7 @@ from ai_docs_agent.agent import (
     DocumentationAnswerService,
 )
 from ai_docs_agent.config import AppSettings
-from ai_docs_agent.models import RetrievalResult, RetrievedChunk
+from ai_docs_agent.models import ConversationMessage, RetrievalResult, RetrievedChunk
 from ai_docs_agent.retrieval import RetrievalError
 
 _REQUIRED: dict[str, Any] = {
@@ -348,6 +348,118 @@ def test_errors_do_not_leak_secrets() -> None:
     message = str(exc_info.value)
     assert "sk-super-secret" not in message
     assert isinstance(exc_info.value, AnswerServiceError)
+
+
+# --- conversation history -----------------------------------------------------------
+
+
+def make_message(role: str = "user", content: str = "hello") -> ConversationMessage:
+    return ConversationMessage(role=role, content=content)  # type: ignore[arg-type]
+
+
+def test_answer_without_history_is_unchanged() -> None:
+    service, retrieval, chat = make_service()
+
+    result = service.answer("how do I configure the client?")
+
+    assert result.answer == "The API key is set via OPENAI_API_KEY."
+    assert retrieval.calls == [("how do I configure the client?", None, None)]
+    prompt = chat.calls[0]["user_prompt"]
+    assert "(no prior conversation history)" in prompt
+
+
+def test_history_appears_in_deterministic_order() -> None:
+    history = (
+        make_message("user", "What is LangChain?"),
+        make_message("assistant", "A framework for LLM applications."),
+        make_message("user", "How do I configure the client?"),
+    )
+    service, _retrieval, chat = make_service()
+
+    service.answer("query", history=history)
+
+    prompt = chat.calls[0]["user_prompt"]
+    assert prompt.index("What is LangChain?") < prompt.index("A framework for LLM applications.")
+    assert prompt.index("A framework for LLM applications.") < prompt.index(
+        "How do I configure the client?"
+    )
+
+
+def test_only_last_ten_history_messages_are_included() -> None:
+    history = tuple(make_message("user", f"turn-{i:02d}-marker") for i in range(12))
+    service, _retrieval, chat = make_service()
+
+    service.answer("query", history=history)
+
+    prompt = chat.calls[0]["user_prompt"]
+    assert "turn-00-marker" not in prompt
+    assert "turn-01-marker" not in prompt
+    assert "turn-02-marker" in prompt
+    assert "turn-11-marker" in prompt
+
+
+def test_history_roles_are_represented_distinctly() -> None:
+    history = (
+        make_message("user", "user turn text"),
+        make_message("assistant", "assistant turn text"),
+    )
+    service, _retrieval, chat = make_service()
+
+    service.answer("query", history=history)
+
+    prompt = chat.calls[0]["user_prompt"]
+    assert "[user]" in prompt
+    assert "[assistant]" in prompt
+    assert prompt.index("[user]") < prompt.index("user turn text")
+    assert prompt.index("[assistant]") < prompt.index("assistant turn text")
+
+
+def test_system_prompt_describes_history_as_continuity_only() -> None:
+    service, _retrieval, chat = make_service()
+
+    service.answer("query")
+
+    system_prompt = chat.calls[0]["system_prompt"].lower()
+    assert "continuity" in system_prompt
+    assert "resolve references" in system_prompt
+
+
+def test_system_prompt_states_documentation_is_sole_factual_source() -> None:
+    service, _retrieval, chat = make_service()
+
+    service.answer("query")
+
+    system_prompt = chat.calls[0]["system_prompt"].lower()
+    assert "not documentation evidence" in system_prompt
+    assert "sole factual source" in system_prompt
+    assert "verified documentation fact" in system_prompt
+
+
+def test_sources_are_unaffected_by_history() -> None:
+    history = (make_message("assistant", "https://malicious.example.com/fake"),)
+    service, _retrieval, _chat = make_service()
+
+    result = service.answer("query", history=history)
+
+    assert len(result.sources) == 1
+    assert result.sources[0].url == "https://docs.example.com/page"
+
+
+def test_supplied_history_sequence_is_not_mutated() -> None:
+    history_list = [make_message("user", "first"), make_message("assistant", "second")]
+    original_copy = list(history_list)
+    service, _retrieval, _chat = make_service()
+
+    service.answer("query", history=history_list)
+
+    assert history_list == original_copy
+
+
+def test_invalid_history_item_type_is_rejected() -> None:
+    service, _retrieval, _chat = make_service()
+
+    with pytest.raises(TypeError):
+        service.answer("query", history=["not a ConversationMessage"])  # type: ignore[list-item]
 
 
 # --- construction / import safety --------------------------------------------------

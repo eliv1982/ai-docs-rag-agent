@@ -5,7 +5,14 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from ai_docs_agent.models import DocumentChunk, DocumentIndexingResult, UrlProcessingResult
+from ai_docs_agent.models import (
+    DocumentChunk,
+    DocumentIndexingResult,
+    PineconeQueryMatch,
+    RetrievalResult,
+    RetrievedChunk,
+    UrlProcessingResult,
+)
 
 
 def make_chunk(**overrides: Any) -> DocumentChunk:
@@ -278,3 +285,148 @@ def test_document_indexing_result_is_frozen() -> None:
 def test_document_indexing_result_rejects_extra_fields() -> None:
     with pytest.raises(ValidationError):
         make_indexing_result(unexpected="field")
+
+
+# --- PineconeQueryMatch --------------------------------------------------------
+
+
+def make_query_match(**overrides: Any) -> PineconeQueryMatch:
+    defaults: dict[str, Any] = {
+        "id": "doc-abc123-chunk-0000",
+        "score": 0.87,
+        "metadata": {"text": "Some chunk text.", "document_id": "doc-abc123"},
+    }
+    return PineconeQueryMatch(**{**defaults, **overrides})
+
+
+def test_pinecone_query_match_is_frozen() -> None:
+    match = make_query_match()
+    with pytest.raises(ValidationError):
+        match.score = 0.5  # type: ignore[misc]
+
+
+def test_pinecone_query_match_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        make_query_match(unexpected="field")
+
+
+# --- RetrievedChunk --------------------------------------------------------
+
+
+def make_retrieved_chunk(**overrides: Any) -> RetrievedChunk:
+    defaults: dict[str, Any] = {
+        "chunk_id": "doc-abc123-chunk-0000",
+        "score": 0.87,
+        "document_id": "doc-abc123",
+        "source_url": "https://docs.example.com/page",
+        "final_url": "https://docs.example.com/page",
+        "title": "Example Page",
+        "content_hash": "hash-value",
+        "chunk_index": 0,
+        "chunk_count": 1,
+        "text": "Some chunk text.",
+    }
+    return RetrievedChunk(**{**defaults, **overrides})
+
+
+def test_retrieved_chunk_rejects_empty_text() -> None:
+    with pytest.raises(ValidationError):
+        make_retrieved_chunk(text="   ")
+
+
+def test_retrieved_chunk_rejects_negative_chunk_index() -> None:
+    with pytest.raises(ValidationError):
+        make_retrieved_chunk(chunk_index=-1)
+
+
+def test_retrieved_chunk_rejects_non_positive_chunk_count() -> None:
+    with pytest.raises(ValidationError):
+        make_retrieved_chunk(chunk_count=0)
+
+
+def test_retrieved_chunk_rejects_index_not_less_than_count() -> None:
+    with pytest.raises(ValidationError):
+        make_retrieved_chunk(chunk_index=2, chunk_count=2)
+
+
+def test_retrieved_chunk_is_frozen() -> None:
+    chunk = make_retrieved_chunk()
+    with pytest.raises(ValidationError):
+        chunk.text = "mutated"  # type: ignore[misc]
+
+
+def test_retrieved_chunk_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        make_retrieved_chunk(unexpected="field")
+
+
+# --- RetrievalResult --------------------------------------------------------
+
+
+def make_retrieval_result(**overrides: Any) -> RetrievalResult:
+    chunks = overrides.pop("matches", (make_retrieved_chunk(),))
+    defaults: dict[str, Any] = {
+        "query": "how do I configure the client?",
+        "namespace": "documentation",
+        "top_k": 5,
+        "matches": chunks,
+    }
+    return RetrievalResult(**{**defaults, **overrides})
+
+
+def test_retrieval_result_accepts_empty_matches() -> None:
+    result = make_retrieval_result(matches=())
+
+    assert result.matches == ()
+
+
+def test_retrieval_result_accepts_fewer_matches_than_top_k() -> None:
+    result = make_retrieval_result(top_k=5, matches=(make_retrieved_chunk(),))
+
+    assert len(result.matches) == 1
+    assert result.top_k == 5
+
+
+def test_retrieval_result_rejects_more_matches_than_top_k() -> None:
+    two_chunks = (
+        make_retrieved_chunk(chunk_id="chunk-a"),
+        make_retrieved_chunk(chunk_id="chunk-b"),
+    )
+    with pytest.raises(ValidationError):
+        make_retrieval_result(top_k=1, matches=two_chunks)
+
+
+def test_retrieval_result_rejects_blank_query() -> None:
+    with pytest.raises(ValidationError):
+        make_retrieval_result(query="   ")
+
+
+def test_retrieval_result_rejects_blank_namespace() -> None:
+    with pytest.raises(ValidationError):
+        make_retrieval_result(namespace="   ")
+
+
+def test_retrieval_result_rejects_top_k_below_one() -> None:
+    with pytest.raises(ValidationError):
+        make_retrieval_result(top_k=0, matches=())
+
+
+def test_retrieval_result_rejects_top_k_above_50() -> None:
+    with pytest.raises(ValidationError):
+        make_retrieval_result(top_k=51, matches=())
+
+
+def test_retrieval_result_accepts_top_k_boundary_values() -> None:
+    assert make_retrieval_result(top_k=1, matches=()).top_k == 1
+    assert make_retrieval_result(top_k=50, matches=()).top_k == 50
+
+
+def test_retrieval_result_is_frozen() -> None:
+    result = make_retrieval_result()
+    with pytest.raises(ValidationError):
+        result.query = "mutated"  # type: ignore[misc]
+
+
+def test_retrieval_result_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        make_retrieval_result(unexpected="field")

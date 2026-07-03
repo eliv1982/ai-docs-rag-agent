@@ -81,6 +81,8 @@ class AppSettings(BaseSettings):
         default=True, validation_alias="PINECONE_REPLACE_OLD_SOURCE_VERSIONS"
     )
 
+    retrieval_top_k: int = Field(default=5, validation_alias="RETRIEVAL_TOP_K")
+
     @field_validator("pinecone_dimension")
     @classmethod
     def _validate_dimension(cls, value: int) -> int:
@@ -221,6 +223,13 @@ class AppSettings(BaseSettings):
             raise ValueError(
                 "pinecone_index_verify_poll_interval_seconds must be greater than zero."
             )
+        return value
+
+    @field_validator("retrieval_top_k")
+    @classmethod
+    def _validate_retrieval_top_k(cls, value: int) -> int:
+        if value < 1 or value > 50:
+            raise ValueError("retrieval_top_k must be between 1 and 50 inclusive.")
         return value
 
     @model_validator(mode="after")

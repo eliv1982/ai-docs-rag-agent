@@ -6,13 +6,14 @@ from typing import Any
 import pytest
 
 from ai_docs_agent.config import AppSettings
-from ai_docs_agent.models import PineconeSmokeTestResult
+from ai_docs_agent.models import PineconeQueryMatch, PineconeSmokeTestResult
 from ai_docs_agent.pinecone_store import (
     PineconeDeleteError,
     PineconeEmbeddingError,
     PineconeFetchError,
     PineconeIndexConfigurationError,
     PineconeIndexNotFoundError,
+    PineconeQueryError,
     PineconeSmokeTestError,
     PineconeStore,
     PineconeStoreError,
@@ -83,15 +84,18 @@ class FakeIndexHandle:
         visible_after: int = 0,
         upsert_response: Any = _AUTO,
         fetch_response: Any = _AUTO,
+        query_response: Any = _AUTO,
     ) -> None:
         self.upserted: list[dict[str, Any]] = []
         self.deleted: list[dict[str, Any]] = []
         self.fetch_calls: list[dict[str, Any]] = []
+        self.similar_query_calls: list[dict[str, Any]] = []
         self._visible_after = visible_after
         self.query_calls = 0
         self.existing_ids: set[str] = set()
         self._upsert_response = upsert_response
         self._fetch_response = fetch_response
+        self._query_response = query_response
 
     def upsert(self, *, vectors: list[dict[str, Any]], namespace: str) -> Any:
         self.upserted.append({"vectors": vectors, "namespace": namespace})
@@ -101,8 +105,29 @@ class FakeIndexHandle:
             return SimpleNamespace(upserted_count=len(vectors))
         return self._upsert_response
 
-    def query(self, *, vector: list[float], top_k: int, include_metadata: bool, namespace: str):
+    def query(
+        self,
+        *,
+        vector: list[float],
+        top_k: int,
+        include_metadata: bool,
+        namespace: str,
+        include_values: bool = False,
+        filter: dict[str, Any] | None = None,  # noqa: A002 - matches Pinecone SDK kwarg
+    ):
         self.query_calls += 1
+        self.similar_query_calls.append(
+            {
+                "vector": vector,
+                "top_k": top_k,
+                "include_metadata": include_metadata,
+                "include_values": include_values,
+                "namespace": namespace,
+                "filter": filter,
+            }
+        )
+        if self._query_response is not _AUTO:
+            return self._query_response
         if not self.upserted or self.query_calls <= self._visible_after:
             return SimpleNamespace(matches=[])
         record = self.upserted[-1]["vectors"][0]
@@ -160,6 +185,21 @@ class RaisingFetchIndexHandle(FakeIndexHandle):
         raise RuntimeError("fetch backend unavailable")
 
 
+class FlakyQueryIndexHandle(FakeIndexHandle):
+    """Raises on its Nth query call (1-indexed); succeeds on every other call."""
+
+    def __init__(self, *, fail_on_call: int) -> None:
+        super().__init__()
+        self._fail_on_call = fail_on_call
+        self._flaky_calls = 0
+
+    def query(self, **kwargs: Any) -> Any:
+        self._flaky_calls += 1
+        if self._flaky_calls == self._fail_on_call:
+            raise RuntimeError("transient query failure")
+        return super().query(**kwargs)
+
+
 class FakeDocumentEmbeddings:
     """Fake OpenAIEmbeddings-like client for embed_documents batches."""
 
@@ -198,6 +238,18 @@ class RaisingDocumentEmbeddings:
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         raise RuntimeError("embedding backend unavailable")
+
+
+class ScriptedQueryEmbeddings:
+    """Returns a fixed, preconfigured embed_query result regardless of input text."""
+
+    def __init__(self, vector: list[Any]) -> None:
+        self._vector = vector
+        self.calls: list[str] = []
+
+    def embed_query(self, text: str) -> list[Any]:
+        self.calls.append(text)
+        return list(self._vector)
 
 
 class FakePineconeClient:
@@ -1100,3 +1152,466 @@ def test_separate_store_instances_do_not_share_cached_handle() -> None:
     store_two.upsert_vectors([_make_record("b")], namespace="documentation")
 
     assert client.index_call_count == 2
+
+
+# --- embed_query ---------------------------------------------------------------
+
+
+def test_embed_query_success_returns_validated_vector() -> None:
+    vector = [0.1] * 1536
+    embeddings = FakeEmbeddings(vector)
+    settings = make_settings()
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    result = store.embed_query("how do I configure the client?")
+
+    assert result == vector
+    assert embeddings.calls == ["how do I configure the client?"]
+
+
+def test_embed_query_rejects_whitespace_only_text_before_client_call() -> None:
+    embeddings = ScriptedQueryEmbeddings([0.1] * 1536)
+    settings = make_settings()
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_query("   ")
+
+    assert embeddings.calls == []
+
+
+def test_embed_query_rejects_dimension_mismatch() -> None:
+    embeddings = ScriptedQueryEmbeddings([0.1] * 10)
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_query("query text")
+
+
+def test_embed_query_rejects_non_numeric_value() -> None:
+    embeddings = ScriptedQueryEmbeddings([0.1] * 1535 + ["not-a-number"])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_query("query text")
+
+
+def test_embed_query_rejects_nan_value() -> None:
+    embeddings = ScriptedQueryEmbeddings([0.1] * 1535 + [float("nan")])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_query("query text")
+
+
+def test_embed_query_rejects_positive_infinite_value() -> None:
+    embeddings = ScriptedQueryEmbeddings([0.1] * 1535 + [float("inf")])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_query("query text")
+
+
+def test_embed_query_rejects_negative_infinite_value() -> None:
+    embeddings = ScriptedQueryEmbeddings([0.1] * 1535 + [float("-inf")])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_query("query text")
+
+
+def test_embed_query_rejects_boolean_value() -> None:
+    embeddings = ScriptedQueryEmbeddings([0.1] * 1535 + [True])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, embeddings=embeddings)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.embed_query("query text")
+
+
+def test_embed_query_wraps_client_failure_with_cause() -> None:
+    settings = make_settings()
+    store = PineconeStore(settings, embeddings=RaisingEmbeddings())
+
+    with pytest.raises(PineconeEmbeddingError) as exc_info:
+        store.embed_query("query text")
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_embed_query_error_does_not_leak_secrets() -> None:
+    settings = make_settings(
+        openai_api_key="sk-super-secret", pinecone_api_key="pc-super-secret"
+    )
+    store = PineconeStore(settings, embeddings=RaisingEmbeddings())
+
+    with pytest.raises(PineconeEmbeddingError) as exc_info:
+        store.embed_query("query text")
+
+    message = str(exc_info.value)
+    assert "sk-super-secret" not in message
+    assert "pc-super-secret" not in message
+
+
+# --- query_similar ---------------------------------------------------------------
+
+
+def _make_object_match(
+    *,
+    match_id: str = "doc-1-chunk-0000",
+    score: float = 0.9,
+    metadata: dict[str, Any] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=match_id,
+        score=score,
+        metadata=metadata if metadata is not None else {"text": "hello", "document_id": "doc-1"},
+    )
+
+
+def test_query_similar_sends_exact_sdk_arguments() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+    vector = [0.1] * 1536
+    metadata_filter = {"kind": {"$eq": "documentation_chunk"}}
+
+    store.query_similar(
+        vector, namespace="documentation", top_k=5, metadata_filter=metadata_filter
+    )
+
+    assert client.index_handle.similar_query_calls == [
+        {
+            "vector": vector,
+            "top_k": 5,
+            "include_metadata": True,
+            "include_values": False,
+            "namespace": "documentation",
+            "filter": metadata_filter,
+        }
+    ]
+
+
+def test_query_similar_parses_object_style_response() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    match = _make_object_match(match_id="a", score=0.9, metadata={"text": "hi"})
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    results = store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    assert results == [PineconeQueryMatch(id="a", score=0.9, metadata={"text": "hi"})]
+
+
+def test_query_similar_parses_mapping_style_response() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(
+        query_response={"matches": [{"id": "a", "score": 0.9, "metadata": {"text": "hi"}}]}
+    )
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    results = store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    assert results == [PineconeQueryMatch(id="a", score=0.9, metadata={"text": "hi"})]
+
+
+def test_query_similar_empty_matches_returns_empty_list() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    results = store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    assert results == []
+
+
+def test_query_similar_preserves_match_order() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    matches = [
+        _make_object_match(match_id="c", score=0.5),
+        _make_object_match(match_id="a", score=0.9),
+        _make_object_match(match_id="b", score=0.7),
+    ]
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=matches))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    results = store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    assert [match.id for match in results] == ["c", "a", "b"]
+
+
+def test_query_similar_reuses_cached_ready_handle() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+    store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    assert client.has_index_call_count == 1
+    assert client.describe_index_call_count == 1
+    assert client.index_call_count == 1
+
+
+def test_query_similar_rejects_invalid_vector_before_network() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings(pinecone_dimension=1536)
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeEmbeddingError):
+        store.query_similar([0.1] * 10, namespace="documentation", top_k=5)
+
+    assert client.index_call_count == 0
+
+
+def test_query_similar_rejects_blank_namespace_before_network() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="   ", top_k=5)
+
+    assert client.index_call_count == 0
+
+
+def test_query_similar_rejects_top_k_below_one_before_network() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=0)
+
+    assert client.index_call_count == 0
+
+
+def test_query_similar_rejects_top_k_above_50_before_network() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=51)
+
+    assert client.index_call_count == 0
+
+
+def test_query_similar_rejects_missing_matches_field() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace())
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_non_sequence_matches_container() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches="not-a-list"))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_missing_id() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    bad_match = SimpleNamespace(score=0.9, metadata={"text": "hi"})
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[bad_match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_blank_id() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    bad_match = SimpleNamespace(id="   ", score=0.9, metadata={"text": "hi"})
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[bad_match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_missing_score() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    bad_match = SimpleNamespace(id="a", metadata={"text": "hi"})
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[bad_match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_non_numeric_score() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    bad_match = SimpleNamespace(id="a", score="high", metadata={"text": "hi"})
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[bad_match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_boolean_score() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    bad_match = SimpleNamespace(id="a", score=True, metadata={"text": "hi"})
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[bad_match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_nan_score() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    bad_match = SimpleNamespace(id="a", score=float("nan"), metadata={"text": "hi"})
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[bad_match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_infinite_score() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    bad_match = SimpleNamespace(id="a", score=float("inf"), metadata={"text": "hi"})
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[bad_match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_missing_metadata() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    bad_match = SimpleNamespace(id="a", score=0.9)
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[bad_match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_none_metadata() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    bad_match = SimpleNamespace(id="a", score=0.9, metadata=None)
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[bad_match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_rejects_non_mapping_metadata() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    bad_match = SimpleNamespace(id="a", score=0.9, metadata="not-a-mapping")
+    client.index_handle = FakeIndexHandle(query_response=SimpleNamespace(matches=[bad_match]))
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+
+def test_query_similar_wraps_sdk_error_with_cause() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = RaisingQueryIndexHandle()
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError) as exc_info:
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_query_similar_invalidates_cache_on_sdk_failure_and_recovers() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = FlakyQueryIndexHandle(fail_on_call=2)
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+    assert client.index_call_count == 1
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    assert client.index_call_count == 2
+
+
+class MalformedThenHealthyQueryIndexHandle(FakeIndexHandle):
+    """Returns a malformed response on its first query call, then healthy
+    matches afterwards; used to prove that a response-parsing failure (as
+    opposed to an SDK exception) does not invalidate the cached index handle."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._calls = 0
+
+    def query(self, **kwargs: Any) -> Any:
+        self._calls += 1
+        if self._calls == 1:
+            return SimpleNamespace()  # missing the required 'matches' field
+        return SimpleNamespace(matches=[_make_object_match(match_id="a", score=0.9)])
+
+
+def test_query_similar_malformed_response_preserves_cached_handle_and_recovers() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = MalformedThenHealthyQueryIndexHandle()
+    settings = make_settings()
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError):
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    assert client.index_call_count == 1
+
+    results = store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    expected_metadata = {"text": "hello", "document_id": "doc-1"}
+    assert results == [PineconeQueryMatch(id="a", score=0.9, metadata=expected_metadata)]
+    assert client.index_call_count == 1
+
+
+def test_query_similar_error_does_not_leak_secrets() -> None:
+    client = FakePineconeClient(existing=True, descriptions=[make_description()])
+    client.index_handle = RaisingQueryIndexHandle()
+    settings = make_settings(
+        openai_api_key="sk-super-secret", pinecone_api_key="pc-super-secret"
+    )
+    store = PineconeStore(settings, client=client)
+
+    with pytest.raises(PineconeQueryError) as exc_info:
+        store.query_similar([0.1] * 1536, namespace="documentation", top_k=5)
+
+    message = str(exc_info.value)
+    assert "sk-super-secret" not in message
+    assert "pc-super-secret" not in message

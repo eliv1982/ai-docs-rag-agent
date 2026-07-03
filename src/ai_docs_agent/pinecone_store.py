@@ -10,7 +10,7 @@ from langchain_openai import OpenAIEmbeddings
 from pinecone import Pinecone, ServerlessSpec
 
 from ai_docs_agent.config import AppSettings
-from ai_docs_agent.models import PineconeIndexStatus, PineconeSmokeTestResult
+from ai_docs_agent.models import PineconeIndexStatus, PineconeQueryMatch, PineconeSmokeTestResult
 
 _SMOKE_TEST_TEXT = "AI Docs RAG Agent Pinecone integration smoke test."
 
@@ -45,6 +45,10 @@ class PineconeFetchError(PineconeStoreError):
 
 class PineconeDeleteError(PineconeStoreError):
     """Raised when deleting vectors from Pinecone by metadata filter fails."""
+
+
+class PineconeQueryError(PineconeStoreError):
+    """Raised when querying Pinecone for similar vectors fails or returns a malformed response."""
 
 
 class EmbeddingsClient(Protocol):
@@ -212,6 +216,18 @@ class PineconeStore:
             values.append(value)
         return values
 
+    def embed_query(self, text: str) -> list[float]:
+        """Create an OpenAI embedding for a single query string."""
+        if not text.strip():
+            raise PineconeEmbeddingError("Query text must not be blank.")
+
+        try:
+            embedding = self._embedding_client.embed_query(text)
+        except Exception as exc:
+            raise PineconeEmbeddingError("Failed to create query embedding.") from exc
+
+        return self._validate_embedding_values(embedding, self._settings.pinecone_dimension)
+
     def upsert_vectors(
         self, vectors: Sequence[dict[str, object]], *, namespace: str
     ) -> int:
@@ -303,6 +319,88 @@ class PineconeStore:
             self._invalidate_ready_index_handle()
             raise PineconeDeleteError(
                 "Failed to delete vectors from Pinecone by filter."
+            ) from exc
+
+    def query_similar(
+        self,
+        vector: Sequence[float],
+        *,
+        namespace: str,
+        top_k: int,
+        metadata_filter: Mapping[str, Any] | None = None,
+    ) -> list[PineconeQueryMatch]:
+        """Query the configured index/namespace for the vectors most similar to `vector`."""
+        validated_vector = self._validate_embedding_values(
+            vector, self._settings.pinecone_dimension
+        )
+        if not namespace.strip():
+            raise PineconeQueryError("Query namespace must not be blank.")
+        if top_k < 1 or top_k > 50:
+            raise PineconeQueryError("top_k must be between 1 and 50 inclusive.")
+
+        index = self._get_ready_index_handle()
+        try:
+            response = index.query(
+                vector=validated_vector,
+                namespace=namespace,
+                top_k=top_k,
+                filter=metadata_filter,
+                include_metadata=True,
+                include_values=False,
+            )
+        except Exception as exc:
+            self._invalidate_ready_index_handle()
+            raise PineconeQueryError("Failed to query Pinecone for similar vectors.") from exc
+
+        return self._extract_query_matches(response)
+
+    @staticmethod
+    def _extract_query_matches(response: Any) -> list[PineconeQueryMatch]:
+        try:
+            if isinstance(response, Mapping):
+                raw_matches = response["matches"]
+            else:
+                raw_matches = response.matches
+        except (KeyError, AttributeError) as exc:
+            raise PineconeQueryError(
+                "Pinecone query response did not include a 'matches' field."
+            ) from exc
+
+        if isinstance(raw_matches, str | bytes) or not isinstance(raw_matches, Sequence):
+            raise PineconeQueryError(
+                "Pinecone query response 'matches' field must be a sequence of matches."
+            )
+
+        return [PineconeStore._parse_query_match(raw_match) for raw_match in raw_matches]
+
+    @staticmethod
+    def _parse_query_match(raw_match: Any) -> PineconeQueryMatch:
+        match_id = PineconeStore._extract_match_field(raw_match, "id")
+        if not isinstance(match_id, str) or not match_id.strip():
+            raise PineconeQueryError("Pinecone query match had a missing or blank 'id'.")
+
+        score = PineconeStore._extract_match_field(raw_match, "score")
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            raise PineconeQueryError("Pinecone query match 'score' must be a numeric value.")
+        score_value = float(score)
+        if math.isnan(score_value) or math.isinf(score_value):
+            raise PineconeQueryError("Pinecone query match 'score' must be finite.")
+
+        metadata = PineconeStore._extract_match_field(raw_match, "metadata")
+        if metadata is None or not isinstance(metadata, Mapping):
+            raise PineconeQueryError("Pinecone query match 'metadata' must be a mapping.")
+
+        return PineconeQueryMatch(id=match_id, score=score_value, metadata=dict(metadata))
+
+    @staticmethod
+    def _extract_match_field(raw_match: Any, field: str) -> Any:
+        try:
+            if isinstance(raw_match, Mapping):
+                return raw_match[field]
+            return getattr(raw_match, field)
+        except (KeyError, AttributeError) as exc:
+            raise PineconeQueryError(
+                f"Pinecone query match did not include a '{field}' field."
             ) from exc
 
     def _get_ready_index_handle(self) -> Any:

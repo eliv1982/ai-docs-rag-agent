@@ -1,5 +1,7 @@
 """Result and status models for Pinecone index operations and URL ingestion."""
 
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 
@@ -211,4 +213,96 @@ class UrlProcessingResult(BaseModel):
                     "final_url, content_hash, and chunk_count."
                 )
 
+        return self
+
+
+class PineconeQueryMatch(BaseModel):
+    """A single low-level scored match returned by PineconeStore.query_similar."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str
+    score: float
+    metadata: dict[str, Any]
+
+
+class RetrievedChunk(BaseModel):
+    """A single retrieval result, decoded from a PineconeQueryMatch's metadata."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    chunk_id: str
+    score: float
+    document_id: str
+    source_url: str
+    final_url: str
+    title: str
+    content_hash: str
+    chunk_index: int
+    chunk_count: int
+    text: str
+
+    @field_validator("text")
+    @classmethod
+    def _validate_text_not_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("text must not be empty.")
+        return value
+
+    @field_validator("chunk_index")
+    @classmethod
+    def _validate_chunk_index(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("chunk_index must be greater than or equal to zero.")
+        return value
+
+    @field_validator("chunk_count")
+    @classmethod
+    def _validate_chunk_count(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("chunk_count must be greater than zero.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_chunk_index_within_count(self) -> "RetrievedChunk":
+        if self.chunk_index >= self.chunk_count:
+            raise ValueError("chunk_index must be less than chunk_count.")
+        return self
+
+
+class RetrievalResult(BaseModel):
+    """The full, internally-consistent outcome of a single retrieval search."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    query: str
+    namespace: str
+    top_k: int
+    matches: tuple[RetrievedChunk, ...]
+
+    @field_validator("query")
+    @classmethod
+    def _validate_query_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("query must not be blank.")
+        return value
+
+    @field_validator("namespace")
+    @classmethod
+    def _validate_namespace_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("namespace must not be blank.")
+        return value
+
+    @field_validator("top_k")
+    @classmethod
+    def _validate_top_k_range(cls, value: int) -> int:
+        if value < 1 or value > 50:
+            raise ValueError("top_k must be between 1 and 50 inclusive.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_matches_do_not_exceed_top_k(self) -> "RetrievalResult":
+        if len(self.matches) > self.top_k:
+            raise ValueError("matches length must not exceed top_k.")
         return self

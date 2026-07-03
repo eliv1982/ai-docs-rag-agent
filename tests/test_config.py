@@ -43,6 +43,7 @@ _ALL_SETTINGS_ENV_VARS = (
     "PINECONE_INDEX_VERIFY_TIMEOUT_SECONDS",
     "PINECONE_INDEX_VERIFY_POLL_INTERVAL_SECONDS",
     "PINECONE_REPLACE_OLD_SOURCE_VERSIONS",
+    "RETRIEVAL_TOP_K",
 )
 
 
@@ -78,6 +79,7 @@ def test_defaults() -> None:
     assert settings.pinecone_index_verify_timeout_seconds == 30
     assert settings.pinecone_index_verify_poll_interval_seconds == 1
     assert settings.pinecone_replace_old_source_versions is True
+    assert settings.retrieval_top_k == 5
 
 
 def test_overrides_are_applied() -> None:
@@ -259,6 +261,46 @@ def test_rejects_index_verify_poll_interval_greater_than_timeout() -> None:
             pinecone_index_verify_timeout_seconds=5,
             pinecone_index_verify_poll_interval_seconds=10,
         )
+
+
+def test_retrieval_top_k_override_is_applied() -> None:
+    settings = make_settings(retrieval_top_k=10)
+
+    assert settings.retrieval_top_k == 10
+
+
+def test_retrieval_top_k_reads_from_environment_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in _ALL_SETTINGS_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
+    monkeypatch.setenv("RETRIEVAL_TOP_K", "12")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.retrieval_top_k == 12
+
+
+def test_rejects_zero_retrieval_top_k() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(retrieval_top_k=0)
+
+
+def test_rejects_negative_retrieval_top_k() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(retrieval_top_k=-1)
+
+
+def test_rejects_retrieval_top_k_above_50() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(retrieval_top_k=51)
+
+
+def test_accepts_retrieval_top_k_boundary_values() -> None:
+    assert make_settings(retrieval_top_k=1).retrieval_top_k == 1
+    assert make_settings(retrieval_top_k=50).retrieval_top_k == 50
 
 
 def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

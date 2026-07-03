@@ -6,8 +6,10 @@ import pytest
 from pydantic import ValidationError
 
 from ai_docs_agent.models import (
+    AnswerSource,
     DocumentChunk,
     DocumentIndexingResult,
+    GroundedAnswerResult,
     PineconeQueryMatch,
     RetrievalResult,
     RetrievedChunk,
@@ -430,3 +432,128 @@ def test_retrieval_result_is_frozen() -> None:
 def test_retrieval_result_rejects_extra_fields() -> None:
     with pytest.raises(ValidationError):
         make_retrieval_result(unexpected="field")
+
+
+# --- AnswerSource --------------------------------------------------------
+
+
+def make_answer_source(**overrides: Any) -> AnswerSource:
+    defaults: dict[str, Any] = {
+        "title": "Example Page",
+        "url": "https://docs.example.com/page",
+        "document_id": "doc-abc123",
+        "chunk_index": 0,
+        "chunk_count": 1,
+    }
+    return AnswerSource(**{**defaults, **overrides})
+
+
+def test_answer_source_accepts_valid_values() -> None:
+    source = make_answer_source()
+
+    assert source.title == "Example Page"
+    assert source.url == "https://docs.example.com/page"
+
+
+def test_answer_source_is_frozen() -> None:
+    source = make_answer_source()
+    with pytest.raises(ValidationError):
+        source.url = "https://mutated.example.com"  # type: ignore[misc]
+
+
+def test_answer_source_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        make_answer_source(unexpected="field")
+
+
+def test_answer_source_rejects_blank_title() -> None:
+    with pytest.raises(ValidationError):
+        make_answer_source(title="   ")
+
+
+def test_answer_source_rejects_blank_url() -> None:
+    with pytest.raises(ValidationError):
+        make_answer_source(url="   ")
+
+
+def test_answer_source_rejects_negative_chunk_index() -> None:
+    with pytest.raises(ValidationError):
+        make_answer_source(chunk_index=-1)
+
+
+def test_answer_source_rejects_non_positive_chunk_count() -> None:
+    with pytest.raises(ValidationError):
+        make_answer_source(chunk_count=0)
+
+
+def test_answer_source_rejects_index_not_less_than_count() -> None:
+    with pytest.raises(ValidationError):
+        make_answer_source(chunk_index=2, chunk_count=2)
+
+
+# --- GroundedAnswerResult --------------------------------------------------------
+
+
+def make_grounded_answer_result(**overrides: Any) -> GroundedAnswerResult:
+    sources = overrides.pop("sources", (make_answer_source(),))
+    defaults: dict[str, Any] = {
+        "question": "how do I configure the client?",
+        "answer": "Set the API key via the OPENAI_API_KEY environment variable.",
+        "sources": sources,
+        "retrieved_chunk_count": 1,
+    }
+    return GroundedAnswerResult(**{**defaults, **overrides})
+
+
+def test_grounded_answer_result_accepts_valid_values() -> None:
+    result = make_grounded_answer_result()
+
+    assert result.retrieved_chunk_count == 1
+    assert len(result.sources) == 1
+
+
+def test_grounded_answer_result_allows_empty_sources_for_zero_context_fallback() -> None:
+    result = make_grounded_answer_result(
+        answer="В базе знаний не найдено достаточно информации для ответа на этот вопрос.",
+        sources=(),
+        retrieved_chunk_count=0,
+    )
+
+    assert result.sources == ()
+    assert result.retrieved_chunk_count == 0
+
+
+def test_grounded_answer_result_rejects_empty_sources_with_positive_chunk_count() -> None:
+    with pytest.raises(ValidationError):
+        make_grounded_answer_result(sources=(), retrieved_chunk_count=1)
+
+
+def test_grounded_answer_result_rejects_nonempty_sources_with_zero_chunk_count() -> None:
+    with pytest.raises(ValidationError):
+        make_grounded_answer_result(retrieved_chunk_count=0)
+
+
+def test_grounded_answer_result_rejects_blank_question() -> None:
+    with pytest.raises(ValidationError):
+        make_grounded_answer_result(question="   ")
+
+
+def test_grounded_answer_result_rejects_blank_answer() -> None:
+    with pytest.raises(ValidationError):
+        make_grounded_answer_result(answer="   ")
+
+
+def test_grounded_answer_result_rejects_negative_retrieved_chunk_count() -> None:
+    with pytest.raises(ValidationError):
+        make_grounded_answer_result(retrieved_chunk_count=-1, sources=())
+
+
+def test_grounded_answer_result_is_frozen() -> None:
+    result = make_grounded_answer_result()
+    with pytest.raises(ValidationError):
+        result.answer = "mutated"  # type: ignore[misc]
+
+
+def test_grounded_answer_result_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        make_grounded_answer_result(unexpected="field")

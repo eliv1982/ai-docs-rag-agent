@@ -11,6 +11,7 @@ from ai_docs_agent.config import AppSettings, get_settings
 _REQUIRED: dict[str, Any] = {
     "openai_api_key": "sk-test-openai",
     "pinecone_api_key": "pc-test-key",
+    "openai_chat_model": "gpt-4o-mini",
 }
 
 # All environment variable names AppSettings binds to, used to isolate tests
@@ -19,6 +20,7 @@ _ALL_SETTINGS_ENV_VARS = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_EMBEDDING_MODEL",
+    "OPENAI_CHAT_MODEL",
     "PINECONE_API_KEY",
     "PINECONE_INDEX_NAME",
     "PINECONE_CLOUD",
@@ -276,6 +278,7 @@ def test_retrieval_top_k_reads_from_environment_variable(
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
+    monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
     monkeypatch.setenv("RETRIEVAL_TOP_K", "12")
 
     settings = AppSettings(_env_file=None)
@@ -303,11 +306,47 @@ def test_accepts_retrieval_top_k_boundary_values() -> None:
     assert make_settings(retrieval_top_k=50).retrieval_top_k == 50
 
 
+def test_openai_chat_model_override_is_applied() -> None:
+    settings = make_settings(openai_chat_model="gpt-4.1-mini")
+
+    assert settings.openai_chat_model == "gpt-4.1-mini"
+
+
+def test_openai_chat_model_reads_from_environment_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in _ALL_SETTINGS_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
+    monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.openai_chat_model == "gpt-4o"
+
+
+def test_rejects_missing_openai_chat_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _ALL_SETTINGS_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
+
+
+def test_rejects_blank_openai_chat_model() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(openai_chat_model="   ")
+
+
 def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in _ALL_SETTINGS_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
+    monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
     # get_settings() reads AppSettings() with its default env_file=".env"; running
     # from an empty tmp_path ensures no real .env is ever read, even if one is
     # later added to the project root.

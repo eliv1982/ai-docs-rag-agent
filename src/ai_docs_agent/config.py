@@ -24,6 +24,7 @@ class AppSettings(BaseSettings):
     openai_embedding_model: str = Field(
         default="text-embedding-3-small", validation_alias="OPENAI_EMBEDDING_MODEL"
     )
+    openai_chat_model: str = Field(validation_alias="OPENAI_CHAT_MODEL")
 
     pinecone_api_key: SecretStr = Field(validation_alias="PINECONE_API_KEY")
     pinecone_index_name: str = Field(
@@ -104,7 +105,7 @@ class AppSettings(BaseSettings):
             raise ValueError("pinecone_smoke_poll_interval_seconds must be greater than zero.")
         return value
 
-    @field_validator("pinecone_index_name", "openai_embedding_model")
+    @field_validator("pinecone_index_name", "openai_embedding_model", "openai_chat_model")
     @classmethod
     def _validate_non_empty(cls, value: str) -> str:
         if not value.strip():

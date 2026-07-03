@@ -306,3 +306,83 @@ class RetrievalResult(BaseModel):
         if len(self.matches) > self.top_k:
             raise ValueError("matches length must not exceed top_k.")
         return self
+
+
+class AnswerSource(BaseModel):
+    """A single document-level source backing a GroundedAnswerResult, derived from
+    retrieved metadata (never model-generated)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    title: str
+    url: str
+    document_id: str
+    chunk_index: int
+    chunk_count: int
+
+    @field_validator("title", "url", "document_id")
+    @classmethod
+    def _validate_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank.")
+        return value
+
+    @field_validator("chunk_index")
+    @classmethod
+    def _validate_chunk_index(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("chunk_index must be greater than or equal to zero.")
+        return value
+
+    @field_validator("chunk_count")
+    @classmethod
+    def _validate_chunk_count(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("chunk_count must be greater than zero.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_chunk_index_within_count(self) -> "AnswerSource":
+        if self.chunk_index >= self.chunk_count:
+            raise ValueError("chunk_index must be less than chunk_count.")
+        return self
+
+
+class GroundedAnswerResult(BaseModel):
+    """The full, internally-consistent outcome of a single grounded RAG answer."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    question: str
+    answer: str
+    sources: tuple[AnswerSource, ...]
+    retrieved_chunk_count: int
+
+    @field_validator("question")
+    @classmethod
+    def _validate_question_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("question must not be blank.")
+        return value
+
+    @field_validator("answer")
+    @classmethod
+    def _validate_answer_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("answer must not be blank.")
+        return value
+
+    @field_validator("retrieved_chunk_count")
+    @classmethod
+    def _validate_retrieved_chunk_count(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("retrieved_chunk_count must be greater than or equal to zero.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_sources_consistency(self) -> "GroundedAnswerResult":
+        if self.retrieved_chunk_count == 0 and self.sources:
+            raise ValueError("sources must be empty when retrieved_chunk_count is zero.")
+        if self.retrieved_chunk_count > 0 and not self.sources:
+            raise ValueError("sources must not be empty when retrieved_chunk_count is positive.")
+        return self

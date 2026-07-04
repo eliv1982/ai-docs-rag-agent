@@ -33,6 +33,7 @@ def _configure_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("openai").setLevel(logging.WARNING)
+    logging.getLogger("pinecone").setLevel(logging.WARNING)
 
 
 def _log_startup_summary(application: Any) -> None:

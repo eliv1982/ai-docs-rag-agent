@@ -19,8 +19,10 @@ PyPIToolStatus = Literal[
     "malformed_response",
     "upstream_http_error",
 ]
-AgentToolName = Literal["documentation_search", "pypi_lookup"]
+AgentToolName = Literal["documentation_search", "pypi_lookup", "user_memory_recall"]
 AgentExecutionOutcome = Literal["success", "safe_fallback"]
+UserMemoryToolStatus = Literal["success", "no_match", "memory_unavailable", "recall_failure"]
+UserMemoryWriteToolStatus = Literal["created", "duplicate"]
 
 
 class PineconeIndexStatus(BaseModel):
@@ -467,6 +469,66 @@ class PyPILookupToolInput(BaseModel):
         return stripped
 
 
+class UserMemoryRecallToolInput(BaseModel):
+    """Structured input schema for the user-memory recall LangChain tool.
+
+    Deliberately contains only the semantic recall query: the trusted session
+    identifier is bound outside this model-visible schema, so the model can
+    never supply or see a user ID or namespace.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    query: str
+
+    @field_validator("query")
+    @classmethod
+    def _validate_query_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("query must not be blank.")
+        return stripped
+
+
+class UserMemoryToolResult(BaseModel):
+    """Safe serialized output for the user-memory recall LangChain tool.
+
+    Carries only the matched preference text and score: no raw user identifier,
+    namespace, vectors, or internal metadata ever appear here.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: UserMemoryToolStatus
+    found: bool
+    preference_text: str | None = None
+    score: float | None = None
+
+    @field_validator("preference_text")
+    @classmethod
+    def _normalize_preference_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def _validate_status_consistency(self) -> "UserMemoryToolResult":
+        if self.status == "success":
+            if not self.found:
+                raise ValueError("found must be true when status is success.")
+            if self.preference_text is None:
+                raise ValueError("preference_text is required when status is success.")
+        else:
+            if self.found:
+                raise ValueError("found must be false for non-success statuses.")
+            if self.preference_text is not None:
+                raise ValueError("preference_text must be None for non-success statuses.")
+            if self.score is not None:
+                raise ValueError("score must be None for non-success statuses.")
+        return self
+
+
 class DocumentationToolResult(BaseModel):
     """Safe serialized output for the documentation-search LangChain tool."""
 
@@ -588,6 +650,75 @@ class LangChainAgentResult(BaseModel):
             raise ValueError("failure_category must be null when outcome is success.")
         if self.outcome == "safe_fallback" and self.failure_category is None:
             raise ValueError("failure_category is required when outcome is safe_fallback.")
+        return self
+
+
+class IntegratedAgentResult(BaseModel):
+    """Typed result of one integrated Telegram request (agent flow or explicit remember)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    question: str
+    answer: str
+    sources: tuple[AnswerSource, ...]
+    tools_used: tuple[AgentToolName, ...]
+    tool_call_count: int
+    used_no_tool: bool
+    outcome: AgentExecutionOutcome
+    failure_category: str | None = None
+    remember_command_detected: bool = False
+    memory_written: bool = False
+    memory_write_status: UserMemoryWriteToolStatus | None = None
+
+    @field_validator("question", "answer")
+    @classmethod
+    def _validate_required_text(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank.")
+        return stripped
+
+    @field_validator("tool_call_count")
+    @classmethod
+    def _validate_tool_call_count(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("tool_call_count must be greater than or equal to zero.")
+        return value
+
+    @field_validator("failure_category")
+    @classmethod
+    def _normalize_failure_category(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def _validate_consistency(self) -> "IntegratedAgentResult":
+        if self.used_no_tool:
+            if self.tools_used:
+                raise ValueError("tools_used must be empty when used_no_tool is true.")
+            if self.tool_call_count != 0:
+                raise ValueError("tool_call_count must be zero when used_no_tool is true.")
+        elif self.tool_call_count == 0:
+            raise ValueError("tool_call_count must be positive when a tool was used.")
+
+        if self.outcome == "success" and self.failure_category is not None:
+            raise ValueError("failure_category must be null when outcome is success.")
+        if self.outcome == "safe_fallback" and self.failure_category is None:
+            raise ValueError("failure_category is required when outcome is safe_fallback.")
+
+        if self.memory_written != (self.memory_write_status == "created"):
+            raise ValueError("memory_written must be true exactly when the status is created.")
+        if self.memory_write_status is not None and not self.remember_command_detected:
+            raise ValueError(
+                "memory_write_status requires remember_command_detected to be true."
+            )
+        if self.remember_command_detected:
+            if self.tools_used or self.tool_call_count != 0:
+                raise ValueError("an explicit remember request must not invoke agent tools.")
+            if self.sources:
+                raise ValueError("an explicit remember request must not carry sources.")
         return self
 
 

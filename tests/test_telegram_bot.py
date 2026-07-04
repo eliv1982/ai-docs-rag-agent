@@ -1,28 +1,34 @@
-"""Unit tests for the Telegram bot boundary.
+"""Unit tests for the Telegram bot boundary over the integrated agent flow.
 
-Uses fake Telegram update/context objects and a fake ConversationAnswerService;
-no real Telegram, OpenAI, or Pinecone calls, and no polling is ever started.
+Uses fake Telegram update/context objects, a fake IntegratedConversationAgentService
+for handler tests, and — for factory tests — the real build_application graph driven
+by a scripted fake tool-calling chat model plus fake retrieval/chat clients. No real
+Telegram, OpenAI, Pinecone, or PyPI calls, and no polling is ever started.
 """
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import Field, ValidationError
 from telegram.ext import CommandHandler, MessageHandler
 
-from ai_docs_agent.agent import (
-    AnswerGenerationError,
-    AnswerRetrievalError,
-    DocumentationAnswerService,
-)
 from ai_docs_agent.config import AppSettings
-from ai_docs_agent.memory import ConversationAnswerService, InMemoryConversationMemory
+from ai_docs_agent.integrated_agent import (
+    IntegratedAgentError,
+    IntegratedConversationAgentService,
+)
+from ai_docs_agent.langchain_agent import LangChainToolCallingAgent
+from ai_docs_agent.memory import InMemoryConversationMemory
 from ai_docs_agent.models import (
     AnswerSource,
     ConversationMessage,
-    GroundedAnswerResult,
+    IntegratedAgentResult,
     RetrievalResult,
     RetrievedChunk,
 )
@@ -33,9 +39,10 @@ from ai_docs_agent.telegram_bot import (
     TelegramStartupSummary,
     build_application,
     build_startup_summary,
-    format_answer,
+    format_integrated_answer,
     split_telegram_message,
 )
+from ai_docs_agent.user_memory import UserMemoryService
 
 _REQUIRED: dict[str, Any] = {
     "openai_api_key": "sk-test-openai",
@@ -61,15 +68,19 @@ def make_source(**overrides: Any) -> AnswerSource:
     return AnswerSource(**{**defaults, **overrides})
 
 
-def make_result(**overrides: Any) -> GroundedAnswerResult:
+def make_integrated_result(**overrides: Any) -> IntegratedAgentResult:
     sources = overrides.pop("sources", (make_source(),))
     defaults: dict[str, Any] = {
         "question": "how do I configure the client?",
         "answer": "Set the API key via the documented environment variable.",
         "sources": sources,
-        "retrieved_chunk_count": 1,
+        "tools_used": ("documentation_search",),
+        "tool_call_count": 1,
+        "used_no_tool": False,
+        "outcome": "success",
+        "failure_category": None,
     }
-    return GroundedAnswerResult(**{**defaults, **overrides})
+    return IntegratedAgentResult(**{**defaults, **overrides})
 
 
 def make_chunk(**overrides: Any) -> RetrievedChunk:
@@ -140,29 +151,22 @@ class FakeContext:
         self.bot = FakeBot()
 
 
-class FakeConversationService:
-    """Fake ConversationAnswerService recording the exact arguments it receives."""
+class FakeIntegratedService:
+    """Fake IntegratedConversationAgentService recording the arguments it receives."""
 
     def __init__(
         self,
         *,
-        result: GroundedAnswerResult | None = None,
+        result: IntegratedAgentResult | None = None,
         error: Exception | None = None,
     ) -> None:
         self._result = result
         self._error = error
-        self.answer_calls: list[tuple[str, str]] = []
+        self.handle_calls: list[tuple[str, str]] = []
         self.reset_calls: list[str] = []
 
-    def answer(
-        self,
-        session_id: str,
-        question: str,
-        *,
-        top_k: int | None = None,
-        namespace: str | None = None,
-    ) -> GroundedAnswerResult:
-        self.answer_calls.append((session_id, question))
+    def handle_message(self, session_id: str, text: str) -> IntegratedAgentResult:
+        self.handle_calls.append((session_id, text))
         if self._error is not None:
             raise self._error
         assert self._result is not None
@@ -170,6 +174,50 @@ class FakeConversationService:
 
     def reset(self, session_id: str) -> None:
         self.reset_calls.append(session_id)
+
+
+# --- factory-test fakes -----------------------------------------------------------
+
+
+class ScriptedDocsToolModel(BaseChatModel):
+    """Fake tool-calling model routing every message to documentation_search."""
+
+    bound_tool_names: list[list[str]] = Field(default_factory=list)
+    model_calls: list[list[BaseMessage]] = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted-docs-tool"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> "ScriptedDocsToolModel":
+        self.bound_tool_names.append([tool.name for tool in tools])
+        return self
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.model_calls.append(list(messages))
+        question = next(
+            str(message.content)
+            for message in reversed(messages)
+            if isinstance(message, HumanMessage)
+        )
+        message = AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "documentation_search",
+                    "args": {"question": question},
+                    "id": "call_1",
+                    "type": "tool_call",
+                }
+            ],
+        )
+        return ChatResult(generations=[ChatGeneration(message=message)])
 
 
 class FactoryFakeRetrievalService:
@@ -277,7 +325,7 @@ def build_live_factory_harness(
     monkeypatch.setattr(agent_module, "RetrievalService", FactoryFakeRetrievalService)
     monkeypatch.setattr(agent_module, "OpenAIChatClient", FactoryFakeChatClient)
 
-    application = build_application(make_settings())
+    application = build_application(make_settings(), chat_model=ScriptedDocsToolModel())
     handlers = application.handlers[0]
     message_handler = next(h for h in handlers if isinstance(h, MessageHandler))
     bot_service = message_handler.callback.__self__
@@ -291,90 +339,108 @@ def build_live_factory_harness(
 
 
 def test_handle_start_sends_introduction() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+    service = TelegramBotService(FakeIntegratedService(result=make_integrated_result()))
     message = FakeMessage("/start")
     update = FakeUpdate(message=message, chat_id=1)
 
     run(service.handle_start(update, FakeContext()))
 
     assert len(message.replies) == 1
-    assert "документац" in message.replies[0].lower()
-    assert "/reset" in message.replies[0]
-    assert "10" in message.replies[0]
+    reply = message.replies[0]
+    assert "документац" in reply.lower()
+    assert "PyPI" in reply
+    assert "Запомни:" in reply
+    assert "/reset" in reply
+    assert "10" in reply
+
+
+def test_start_message_describes_reset_semantics_accurately() -> None:
+    service = TelegramBotService(FakeIntegratedService(result=make_integrated_result()))
+    message = FakeMessage("/start")
+    update = FakeUpdate(message=message, chat_id=1)
+
+    run(service.handle_start(update, FakeContext()))
+
+    reply = message.replies[0]
+    # /reset clears dialogue context but does not delete explicitly saved preferences.
+    assert "не удаляет" in reply or "не удалены" in reply
+    # Ordinary conversation is never claimed to be stored automatically.
+    assert "никогда не" in reply
 
 
 # --- /reset --------------------------------------------------------------------------
 
 
 def test_handle_reset_calls_reset_with_chat_id_session() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+    integrated = FakeIntegratedService(result=make_integrated_result())
+    service = TelegramBotService(integrated)
     update = FakeUpdate(message=FakeMessage("/reset"), chat_id=42)
 
     run(service.handle_reset(update, FakeContext()))
 
-    assert conversation.reset_calls == ["42"]
+    assert integrated.reset_calls == ["42"]
 
 
-def test_handle_reset_sends_confirmation() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+def test_handle_reset_sends_confirmation_that_preserves_saved_preferences() -> None:
+    integrated = FakeIntegratedService(result=make_integrated_result())
+    service = TelegramBotService(integrated)
     message = FakeMessage("/reset")
     update = FakeUpdate(message=message, chat_id=42)
 
     run(service.handle_reset(update, FakeContext()))
 
-    assert message.replies == ["История текущего диалога очищена."]
+    assert len(message.replies) == 1
+    reply = message.replies[0]
+    assert "очищен" in reply.lower()
+    assert "не удалены" in reply  # never claims saved preferences were deleted
 
 
 def test_handle_reset_of_empty_session_succeeds() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+    integrated = FakeIntegratedService(result=make_integrated_result())
+    service = TelegramBotService(integrated)
     update = FakeUpdate(message=FakeMessage("/reset"), chat_id=999)
 
     run(service.handle_reset(update, FakeContext()))  # must not raise
 
-    assert conversation.reset_calls == ["999"]
+    assert integrated.reset_calls == ["999"]
 
 
-# --- ordinary text questions ---------------------------------------------------------
+# --- ordinary text messages ---------------------------------------------------------
 
 
 def test_handle_text_uses_correct_session_id() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+    integrated = FakeIntegratedService(result=make_integrated_result())
+    service = TelegramBotService(integrated)
     update = FakeUpdate(message=FakeMessage("What is LangChain?"), chat_id=777)
 
     run(service.handle_text(update, FakeContext()))
 
-    assert conversation.answer_calls == [("777", "What is LangChain?")]
+    assert integrated.handle_calls == [("777", "What is LangChain?")]
 
 
 def test_handle_text_different_chats_remain_distinct() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+    integrated = FakeIntegratedService(result=make_integrated_result())
+    service = TelegramBotService(integrated)
 
     run(service.handle_text(FakeUpdate(message=FakeMessage("q1"), chat_id=1), FakeContext()))
     run(service.handle_text(FakeUpdate(message=FakeMessage("q2"), chat_id=2), FakeContext()))
 
-    assert conversation.answer_calls == [("1", "q1"), ("2", "q2")]
+    assert integrated.handle_calls == [("1", "q1"), ("2", "q2")]
 
 
 def test_handle_text_strips_question() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+    integrated = FakeIntegratedService(result=make_integrated_result())
+    service = TelegramBotService(integrated)
     update = FakeUpdate(message=FakeMessage("   how do I configure it?   "), chat_id=1)
 
     run(service.handle_text(update, FakeContext()))
 
-    assert conversation.answer_calls == [("1", "how do I configure it?")]
+    assert integrated.handle_calls == [("1", "how do I configure it?")]
 
 
 def test_handle_text_successful_answer_formatting() -> None:
-    result = make_result(answer="The answer text.", sources=(make_source(),))
-    conversation = FakeConversationService(result=result)
-    service = TelegramBotService(conversation)
+    result = make_integrated_result(answer="The answer text.", sources=(make_source(),))
+    service = TelegramBotService(FakeIntegratedService(result=result))
     message = FakeMessage("query")
     update = FakeUpdate(message=message, chat_id=1)
 
@@ -392,9 +458,8 @@ def test_handle_text_deterministic_source_order() -> None:
         make_source(title="Page A", url="https://docs.example.com/a"),
         make_source(title="Page B", url="https://docs.example.com/b"),
     )
-    result = make_result(sources=sources, retrieved_chunk_count=2)
-    conversation = FakeConversationService(result=result)
-    service = TelegramBotService(conversation)
+    result = make_integrated_result(sources=sources)
+    service = TelegramBotService(FakeIntegratedService(result=result))
     message = FakeMessage("query")
     update = FakeUpdate(message=message, chat_id=1)
 
@@ -405,13 +470,14 @@ def test_handle_text_deterministic_source_order() -> None:
 
 
 def test_handle_text_empty_source_formatting() -> None:
-    result = make_result(
+    result = make_integrated_result(
         answer="В базе знаний не найдено достаточно информации для ответа на этот вопрос.",
         sources=(),
-        retrieved_chunk_count=0,
+        tools_used=("documentation_search",),
+        outcome="safe_fallback",
+        failure_category="no_context",
     )
-    conversation = FakeConversationService(result=result)
-    service = TelegramBotService(conversation)
+    service = TelegramBotService(FakeIntegratedService(result=result))
     message = FakeMessage("query")
     update = FakeUpdate(message=message, chat_id=1)
 
@@ -420,9 +486,32 @@ def test_handle_text_empty_source_formatting() -> None:
     assert "Источники: не найдены" in message.replies[0]
 
 
+def test_handle_text_memory_confirmation_has_no_source_block() -> None:
+    result = make_integrated_result(
+        question="Запомни: в примерах я предпочитаю httpx.",
+        answer="Предпочтение сохранено. Я буду учитывать его, когда вы спросите о нём.",
+        sources=(),
+        tools_used=(),
+        tool_call_count=0,
+        used_no_tool=True,
+        remember_command_detected=True,
+        memory_written=True,
+        memory_write_status="created",
+    )
+    service = TelegramBotService(FakeIntegratedService(result=result))
+    message = FakeMessage("Запомни: в примерах я предпочитаю httpx.")
+    update = FakeUpdate(message=message, chat_id=1)
+
+    run(service.handle_text(update, FakeContext()))
+
+    reply = message.replies[0]
+    assert reply == "Предпочтение сохранено. Я буду учитывать его, когда вы спросите о нём."
+    assert "Источники" not in reply
+    assert "memory-" not in reply
+
+
 def test_handle_text_sends_typing_indicator() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+    service = TelegramBotService(FakeIntegratedService(result=make_integrated_result()))
     update = FakeUpdate(message=FakeMessage("query"), chat_id=55)
     context = FakeContext()
 
@@ -431,9 +520,8 @@ def test_handle_text_sends_typing_indicator() -> None:
     assert context.bot.typing_calls == [55]
 
 
-def test_handle_text_retrieval_error_produces_safe_message() -> None:
-    conversation = FakeConversationService(error=AnswerRetrievalError("boom"))
-    service = TelegramBotService(conversation)
+def test_handle_text_integrated_error_produces_safe_message() -> None:
+    service = TelegramBotService(FakeIntegratedService(error=IntegratedAgentError("boom")))
     message = FakeMessage("query")
     update = FakeUpdate(message=message, chat_id=1)
 
@@ -442,9 +530,8 @@ def test_handle_text_retrieval_error_produces_safe_message() -> None:
     assert message.replies == ["Не удалось подготовить ответ. Попробуйте повторить запрос позже."]
 
 
-def test_handle_text_generation_error_produces_safe_message() -> None:
-    conversation = FakeConversationService(error=AnswerGenerationError("boom"))
-    service = TelegramBotService(conversation)
+def test_handle_text_unexpected_error_produces_safe_message() -> None:
+    service = TelegramBotService(FakeIntegratedService(error=RuntimeError("boom")))
     message = FakeMessage("query")
     update = FakeUpdate(message=message, chat_id=1)
 
@@ -456,10 +543,11 @@ def test_handle_text_generation_error_produces_safe_message() -> None:
 def test_handle_text_logs_service_exception_safely(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    conversation = FakeConversationService(
-        error=AnswerRetrievalError("sk-super-secret-leaked pc-super-secret-leaked")
+    service = TelegramBotService(
+        FakeIntegratedService(
+            error=IntegratedAgentError("sk-super-secret-leaked pc-super-secret-leaked")
+        )
     )
-    service = TelegramBotService(conversation)
     message = FakeMessage("How do I configure the client?", chat_id=424242)
     update = FakeUpdate(message=message, chat_id=424242)
 
@@ -468,7 +556,7 @@ def test_handle_text_logs_service_exception_safely(
 
     assert message.replies == ["Не удалось подготовить ответ. Попробуйте повторить запрос позже."]
     assert "Traceback" in caplog.text
-    assert "AnswerRetrievalError" in caplog.text
+    assert "IntegratedAgentError" in caplog.text
     assert "424242" not in caplog.text
     assert "How do I configure the client?" not in caplog.text
     assert "sk-super-secret-leaked" not in caplog.text
@@ -477,10 +565,11 @@ def test_handle_text_logs_service_exception_safely(
 
 
 def test_handle_text_error_output_does_not_leak_secret_shaped_text() -> None:
-    conversation = FakeConversationService(
-        error=AnswerRetrievalError("sk-super-secret-leaked pc-super-secret-leaked")
+    service = TelegramBotService(
+        FakeIntegratedService(
+            error=IntegratedAgentError("sk-super-secret-leaked pc-super-secret-leaked")
+        )
     )
-    service = TelegramBotService(conversation)
     message = FakeMessage("query")
     update = FakeUpdate(message=message, chat_id=1)
 
@@ -493,40 +582,40 @@ def test_handle_text_error_output_does_not_leak_secret_shaped_text() -> None:
 
 
 def test_handle_text_blank_text_is_ignored_safely() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+    integrated = FakeIntegratedService(result=make_integrated_result())
+    service = TelegramBotService(integrated)
     message = FakeMessage("   ")
     update = FakeUpdate(message=message, chat_id=1)
 
     run(service.handle_text(update, FakeContext()))
 
-    assert conversation.answer_calls == []
+    assert integrated.handle_calls == []
     assert message.replies == []
 
 
 def test_handle_text_non_text_message_is_ignored_safely() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+    integrated = FakeIntegratedService(result=make_integrated_result())
+    service = TelegramBotService(integrated)
     message = FakeMessage(None)  # e.g. a photo/sticker with no text
     update = FakeUpdate(message=message, chat_id=1)
 
     run(service.handle_text(update, FakeContext()))
 
-    assert conversation.answer_calls == []
+    assert integrated.handle_calls == []
     assert message.replies == []
 
 
 def test_handle_text_missing_message_is_ignored_safely() -> None:
-    conversation = FakeConversationService(result=make_result())
-    service = TelegramBotService(conversation)
+    integrated = FakeIntegratedService(result=make_integrated_result())
+    service = TelegramBotService(integrated)
     update = FakeUpdate(message=None)
 
     run(service.handle_text(update, FakeContext()))  # must not raise
 
-    assert conversation.answer_calls == []
+    assert integrated.handle_calls == []
 
 
-# --- format_answer ---------------------------------------------------------------
+# --- format_integrated_answer -------------------------------------------------------
 
 
 def test_format_answer_includes_sources_in_order() -> None:
@@ -534,20 +623,74 @@ def test_format_answer_includes_sources_in_order() -> None:
         make_source(title="Page A", url="https://docs.example.com/a"),
         make_source(title="Page B", url="https://docs.example.com/b"),
     )
-    result = make_result(answer="Answer text.", sources=sources, retrieved_chunk_count=2)
+    result = make_integrated_result(answer="Answer text.", sources=sources)
 
-    text = format_answer(result)
+    text = format_integrated_answer(result)
 
     assert text.startswith("Answer text.")
     assert text.index("1. Page A") < text.index("2. Page B")
 
 
 def test_format_answer_empty_sources() -> None:
-    result = make_result(answer="Answer text.", sources=(), retrieved_chunk_count=0)
+    result = make_integrated_result(
+        answer="Answer text.",
+        sources=(),
+        tools_used=("documentation_search",),
+        outcome="safe_fallback",
+        failure_category="no_context",
+    )
 
-    text = format_answer(result)
+    text = format_integrated_answer(result)
 
     assert "Источники: не найдены" in text
+
+
+def test_format_answer_labels_memory_recall_as_personal_memory() -> None:
+    result = make_integrated_result(
+        answer="Ваше сохранённое предпочтение: в примерах я предпочитаю httpx.",
+        sources=(),
+        tools_used=("user_memory_recall",),
+    )
+
+    text = format_integrated_answer(result)
+
+    assert "персональная память" in text
+    assert "Источники: не найдены" not in text
+    # Never mislabeled as documentation or PyPI.
+    assert "PyPI" not in text
+    assert "документац" not in text.lower()
+
+
+def test_format_answer_memory_no_match_shows_no_fake_sources() -> None:
+    result = make_integrated_result(
+        answer="У вас пока нет сохранённых предпочтений, подходящих под этот вопрос.",
+        sources=(),
+        tools_used=("user_memory_recall",),
+        outcome="safe_fallback",
+        failure_category="memory_no_match",
+    )
+
+    text = format_integrated_answer(result)
+
+    assert "Источники: не найдены" in text
+    assert "персональная память" not in text
+
+
+def test_format_answer_remember_confirmation_is_bare() -> None:
+    result = make_integrated_result(
+        answer="Предпочтение сохранено. Я буду учитывать его, когда вы спросите о нём.",
+        sources=(),
+        tools_used=(),
+        tool_call_count=0,
+        used_no_tool=True,
+        remember_command_detected=True,
+        memory_written=True,
+        memory_write_status="created",
+    )
+
+    text = format_integrated_answer(result)
+
+    assert text == result.answer
 
 
 # --- message splitting -----------------------------------------------------------
@@ -642,7 +785,7 @@ def test_split_rejects_non_positive_max_length() -> None:
 def test_build_application_registers_all_handlers() -> None:
     settings = make_settings()
 
-    application = build_application(settings)
+    application = build_application(settings, chat_model=ScriptedDocsToolModel())
 
     handlers = application.handlers[0]
     assert len(handlers) == 3
@@ -661,7 +804,7 @@ def test_build_application_records_safe_startup_summary() -> None:
         retrieval_top_k=7,
     )
 
-    application = build_application(settings)
+    application = build_application(settings, chat_model=ScriptedDocsToolModel())
 
     assert application.bot_data[_STARTUP_SUMMARY_BOT_DATA_KEY] == TelegramStartupSummary(
         pinecone_index_name="docs-index",
@@ -675,7 +818,7 @@ def test_build_application_records_safe_startup_summary() -> None:
 def test_build_application_uses_injected_settings_for_answer_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import ai_docs_agent.telegram_bot as telegram_bot_module
+    import ai_docs_agent.integrated_agent as integrated_agent_module
 
     settings = make_settings(pinecone_documents_namespace="docs-live")
     captured: dict[str, Any] = {}
@@ -684,13 +827,16 @@ def test_build_application_uses_injected_settings_for_answer_service(
         def __init__(self, received_settings: AppSettings) -> None:
             captured["settings"] = received_settings
 
+        def answer(self, question: str, *, history: Sequence[Any] = ()) -> Any:
+            raise NotImplementedError
+
     monkeypatch.setattr(
-        telegram_bot_module,
+        integrated_agent_module,
         "DocumentationAnswerService",
         RecordingAnswerService,
     )
 
-    build_application(settings)
+    build_application(settings, chat_model=ScriptedDocsToolModel())
 
     assert captured["settings"] is settings
 
@@ -698,9 +844,23 @@ def test_build_application_uses_injected_settings_for_answer_service(
 def test_build_application_accepts_injected_settings_without_network() -> None:
     settings = make_settings(telegram_bot_token="another-fake-token")
 
-    application = build_application(settings)  # must not raise or touch the network
+    application = build_application(
+        settings, chat_model=ScriptedDocsToolModel()
+    )  # must not raise or touch the network
 
     assert application is not None
+
+
+def test_build_application_wires_the_real_integrated_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _application, bot_service, _retrieval, _chat = build_live_factory_harness(monkeypatch)
+
+    integrated = bot_service._integrated_service
+    assert isinstance(integrated, IntegratedConversationAgentService)
+    assert isinstance(integrated._agent, LangChainToolCallingAgent)
+    assert isinstance(integrated._user_memory_service, UserMemoryService)
+    assert isinstance(integrated._memory, InMemoryConversationMemory)
 
 
 def test_build_application_real_factory_alias_follow_up_uses_memory_and_contextual_retry(
@@ -712,27 +872,24 @@ def test_build_application_real_factory_alias_follow_up_uses_memory_and_contextu
         h for h in application.handlers[0] if isinstance(h, MessageHandler)
     )
 
-    assert isinstance(bot_service._conversation_service, ConversationAnswerService)
-    assert isinstance(bot_service._conversation_service._memory, InMemoryConversationMemory)
-    assert isinstance(
-        bot_service._conversation_service._answer_service,
-        DocumentationAnswerService,
+    alias_message = FakeMessage(_ALIAS_SET_QUESTION, chat_id=90121)
+    run(
+        message_handler.callback(
+            FakeUpdate(message=alias_message, chat_id=90121), FakeContext()
+        )
     )
 
-    alias_message = FakeMessage(_ALIAS_SET_QUESTION, chat_id=101)
-    run(message_handler.callback(FakeUpdate(message=alias_message, chat_id=101), FakeContext()))
-
-    history = bot_service._conversation_service._memory.get_history("101")
+    history = bot_service._integrated_service._memory.get_history("90121")
     assert isinstance(history, tuple)
     assert len(history) == 2
     assert all(isinstance(message, ConversationMessage) for message in history)
     assert [message.role for message in history] == ["user", "assistant"]
 
-    follow_up_message = FakeMessage(_ALIAS_FOLLOW_UP_QUESTION, chat_id=101)
+    follow_up_message = FakeMessage(_ALIAS_FOLLOW_UP_QUESTION, chat_id=90121)
     with caplog.at_level(logging.INFO):
         run(
             message_handler.callback(
-                FakeUpdate(message=follow_up_message, chat_id=101),
+                FakeUpdate(message=follow_up_message, chat_id=90121),
                 FakeContext(),
             )
         )
@@ -749,11 +906,12 @@ def test_build_application_real_factory_alias_follow_up_uses_memory_and_contextu
     assert "history_turn_count=1" in caplog.text
     assert "contextual_retry_eligible=true" in caplog.text
     assert "contextual_retry_reason=eligible" in caplog.text
+    assert "documentation_search" in caplog.text
     assert _ALIAS_SET_QUESTION not in caplog.text
     assert _ALIAS_FOLLOW_UP_QUESTION not in caplog.text
     assert "LEAK_SPLITTER_DOC_BODY" not in caplog.text
     assert "LEAK_DIRECT_LOW_SCORE_1" not in caplog.text
-    assert "101" not in caplog.text
+    assert "90121" not in caplog.text
 
 
 def test_build_application_real_factory_session_isolation_and_reset_block_alias_reuse(
@@ -797,7 +955,7 @@ def test_build_application_real_factory_session_isolation_and_reset_block_alias_
             FakeContext(),
         )
     )
-    assert bot_service._conversation_service._memory.get_history("1") == ()
+    assert bot_service._integrated_service._memory.get_history("1") == ()
 
     reset_follow_up_message = FakeMessage(_ALIAS_FOLLOW_UP_QUESTION, chat_id=1)
     run(

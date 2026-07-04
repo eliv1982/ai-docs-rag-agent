@@ -83,6 +83,46 @@ def test_main_logs_safe_startup_summary(
     assert "test-telegram-token" not in caplog.text
 
 
+def test_configure_logging_preserves_ai_docs_info_and_suppresses_pinecone_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    module = _load_script_module()
+    ai_docs_logger = logging.getLogger("ai_docs_agent.test_logger")
+    pinecone_logger = logging.getLogger("pinecone.index")
+    pinecone_parent_logger = logging.getLogger("pinecone")
+    original_ai_docs_level = ai_docs_logger.level
+    original_pinecone_level = pinecone_logger.level
+    original_pinecone_parent_level = pinecone_parent_logger.level
+
+    try:
+        ai_docs_logger.setLevel(logging.NOTSET)
+        pinecone_logger.setLevel(logging.NOTSET)
+        pinecone_parent_logger.setLevel(logging.NOTSET)
+
+        module._configure_logging()
+
+        with caplog.at_level(logging.INFO):
+            ai_docs_logger.info("safe ai_docs_agent info message")
+            pinecone_logger.info(
+                "Upserting 1 vectors into namespace 'user-memory-full-digest-secret'"
+            )
+            pinecone_logger.info(
+                "Connecting to Pinecone index host example-index-host-1234.svc.us-east1.pinecone.io"
+            )
+            pinecone_logger.warning("pinecone warning still visible")
+            pinecone_logger.error("pinecone error still visible")
+
+        assert "safe ai_docs_agent info message" in caplog.text
+        assert "user-memory-full-digest-secret" not in caplog.text
+        assert "example-index-host-1234.svc.us-east1.pinecone.io" not in caplog.text
+        assert "pinecone warning still visible" in caplog.text
+        assert "pinecone error still visible" in caplog.text
+    finally:
+        ai_docs_logger.setLevel(original_ai_docs_level)
+        pinecone_logger.setLevel(original_pinecone_level)
+        pinecone_parent_logger.setLevel(original_pinecone_parent_level)
+
+
 def test_main_returns_nonzero_when_build_raises_validation_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

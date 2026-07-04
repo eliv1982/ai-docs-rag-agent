@@ -1,17 +1,21 @@
-"""Minimal Telegram interface: chat_id -> session_id -> ConversationAnswerService.
+"""Telegram interface over the final integrated agent flow (Stage 4I).
 
 Pipeline: Telegram text message -> str(chat_id) as session_id ->
-ConversationAnswerService.answer() -> deterministic answer + source-list text ->
-Telegram response, split into <=4000-character parts on newline boundaries
-where practical. /start sends a short introduction; /reset clears only the
-current chat's history via ConversationAnswerService.reset(). Only question
-and answer text ever pass through the existing memory layer -- no Telegram
-message objects, usernames, or other metadata are stored, and Pinecone
-namespaces/top_k/model names are never exposed to chat users. No URL
-indexing, tools, admin controls, or persistence are implemented here.
+IntegratedConversationAgentService.handle_message() -> either the deterministic
+explicit "Запомни: ..." persistent-memory path or autonomous LangChain tool
+selection (documentation_search / pypi_lookup / request-scoped
+user_memory_recall) -> deterministic answer + source-list text -> Telegram
+response, split into <=4000-character parts on newline boundaries where
+practical. /start sends a short introduction; /reset clears only the current
+chat's short-term history and never deletes explicitly saved persistent
+preferences. Only question and answer text ever pass through the short-term
+memory layer -- no Telegram message objects, usernames, or other metadata are
+stored, and Pinecone namespaces/record IDs/identity digests/top_k/model names
+are never exposed to chat users. No URL indexing or admin controls are
+implemented here.
 
 Importing this module builds nothing and makes no network calls: settings,
-the answer/memory service stack, and the Telegram Application are all
+the integrated service graph, and the Telegram Application are all
 constructed lazily by build_application()/run_bot(), which are the only
 explicit startup entry points.
 """
@@ -19,6 +23,7 @@ explicit startup entry points.
 import logging
 from dataclasses import dataclass
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -30,14 +35,13 @@ from telegram.ext import (
     filters,
 )
 
-from ai_docs_agent.agent import (
-    AnswerServiceError,
-    DocumentationAnswerService,
-    get_retrieval_score_threshold,
-)
+from ai_docs_agent.agent import get_retrieval_score_threshold
 from ai_docs_agent.config import AppSettings, get_settings
-from ai_docs_agent.memory import ConversationAnswerService, InMemoryConversationMemory
-from ai_docs_agent.models import GroundedAnswerResult
+from ai_docs_agent.integrated_agent import (
+    IntegratedConversationAgentService,
+    build_integrated_service,
+)
+from ai_docs_agent.models import IntegratedAgentResult
 from ai_docs_agent.observability import (
     hash_session_id,
     log_exception_safely,
@@ -48,15 +52,24 @@ _TELEGRAM_MAX_MESSAGE_LENGTH = 4000
 _STARTUP_SUMMARY_BOT_DATA_KEY = "telegram_startup_summary"
 
 _START_MESSAGE = (
-    "Привет! Я отвечаю на вопросы по индексированной технической документации.\n\n"
-    "Я запоминаю до 10 последних сообщений в текущем диалоге — ваши вопросы и мои ответы.\n\n"
-    "Команда /reset очищает историю текущего диалога.\n"
-    "После перезапуска бота история не сохраняется."
+    "Привет! Я отвечаю на вопросы по индексированной технической документации и могу "
+    "узнать актуальные данные пакета на PyPI (например, последнюю версию).\n\n"
+    "Команда «Запомни: ...» явно сохраняет ваше личное предпочтение — например: "
+    "«Запомни: в примерах я предпочитаю httpx.» Обычные сообщения никогда не "
+    "сохраняются как предпочтения.\n\n"
+    "Я учитываю до 10 последних сообщений текущего диалога для связности.\n"
+    "Команда /reset очищает контекст текущего диалога, но не удаляет явно "
+    "сохранённые предпочтения."
 )
 
-_RESET_CONFIRMATION = "История текущего диалога очищена."
+_RESET_CONFIRMATION = (
+    "Контекст текущего диалога очищен. Явно сохранённые предпочтения "
+    "(через «Запомни: ...») не удалены."
+)
 
 _ANSWER_FAILURE_MESSAGE = "Не удалось подготовить ответ. Попробуйте повторить запрос позже."
+
+_MEMORY_SOURCE_LABEL = "Источник: ваше сохранённое предпочтение (персональная память)"
 
 logger = logging.getLogger(__name__)
 
@@ -102,35 +115,43 @@ def split_telegram_message(
     return parts
 
 
-def format_answer(result: GroundedAnswerResult) -> str:
-    """Render a GroundedAnswerResult as the deterministic Telegram response text."""
+def format_integrated_answer(result: IntegratedAgentResult) -> str:
+    """Render an IntegratedAgentResult as the deterministic Telegram response text."""
+    if result.remember_command_detected:
+        # Memory confirmations are self-contained; no source block applies.
+        return result.answer
+
     lines = [result.answer, ""]
-    if not result.sources:
-        lines.append("Источники: не найдены")
-    else:
+    if result.sources:
         lines.append("Источники:")
         for rank, source in enumerate(result.sources, start=1):
             lines.append(f"{rank}. {source.title} — {source.url}")
+    elif "user_memory_recall" in result.tools_used and result.outcome == "success":
+        # A recalled preference is user-provided memory, never documentation
+        # or PyPI data, so it gets its own clearly labeled source type.
+        lines.append(_MEMORY_SOURCE_LABEL)
+    else:
+        lines.append("Источники: не найдены")
     return "\n".join(lines)
 
 
 class TelegramBotService:
-    """Telegram-specific handlers wrapping ConversationAnswerService.
+    """Telegram-specific handlers wrapping IntegratedConversationAgentService.
 
-    Holds no RAG or memory logic of its own; every question is answered
-    through the injected ConversationAnswerService, keyed by
-    str(chat_id) as session_id.
+    Holds no RAG, agent, or memory logic of its own; every message is handled
+    through the injected integrated service, keyed by str(chat_id) as
+    session_id.
     """
 
-    def __init__(self, conversation_service: ConversationAnswerService) -> None:
-        self._conversation_service = conversation_service
+    def __init__(self, integrated_service: IntegratedConversationAgentService) -> None:
+        self._integrated_service = integrated_service
 
     async def handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._reply(update, _START_MESSAGE)
 
     async def handle_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         session_id = self._session_id(update)
-        self._conversation_service.reset(session_id)
+        self._integrated_service.reset(session_id)
         await self._reply(update, _RESET_CONFIRMATION)
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -152,9 +173,12 @@ class TelegramBotService:
 
         try:
             with request_logging_context(session_id=session_id):
-                result = self._conversation_service.answer(session_id, question)
-                response_text = format_answer(result)
-        except AnswerServiceError as exc:
+                result = self._integrated_service.handle_message(session_id, question)
+                response_text = format_integrated_answer(result)
+        except Exception as exc:
+            # Expected domain failures arrive as IntegratedAgentError; anything
+            # else is mapped to the same safe user-facing message so the bot
+            # never leaks internals or crashes the handler.
             log_exception_safely(
                 logger,
                 (
@@ -189,17 +213,21 @@ class TelegramBotService:
             pass  # Telegram send/runtime failure at the outer boundary: nothing more to do.
 
 
-def build_application(settings: AppSettings | None = None) -> Application:
+def build_application(
+    settings: AppSettings | None = None,
+    *,
+    chat_model: BaseChatModel | None = None,
+) -> Application:
     """Construct the Telegram Application with all handlers registered.
 
-    Loads settings and builds the RAG/memory service stack only when this
-    function is called explicitly; importing this module never does.
+    Loads settings and builds the integrated agent/memory service graph only
+    when this function is called explicitly; importing this module never does.
+    `chat_model` is injectable so tests can drive the same factory graph with a
+    scripted fake tool-calling model.
     """
     resolved_settings = settings or get_settings()
-    answer_service = DocumentationAnswerService(resolved_settings)
-    memory = InMemoryConversationMemory()
-    conversation_service = ConversationAnswerService(answer_service, memory=memory)
-    bot_service = TelegramBotService(conversation_service)
+    integrated_service = build_integrated_service(resolved_settings, chat_model=chat_model)
+    bot_service = TelegramBotService(integrated_service)
 
     application = (
         ApplicationBuilder()

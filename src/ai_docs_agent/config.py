@@ -1,11 +1,13 @@
 """Typed application configuration loaded from environment variables."""
 
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _SUPPORTED_METRICS = frozenset({"cosine"})
+_SUPPORTED_HTTP_SCHEMES = frozenset({"http", "https"})
 
 
 class AppSettings(BaseSettings):
@@ -83,6 +85,8 @@ class AppSettings(BaseSettings):
     )
 
     retrieval_top_k: int = Field(default=5, validation_alias="RETRIEVAL_TOP_K")
+    pypi_base_url: str = Field(default="https://pypi.org", validation_alias="PYPI_BASE_URL")
+    pypi_timeout_seconds: float = Field(default=10, validation_alias="PYPI_TIMEOUT_SECONDS")
 
     telegram_bot_token: SecretStr = Field(validation_alias="TELEGRAM_BOT_TOKEN")
 
@@ -233,6 +237,34 @@ class AppSettings(BaseSettings):
     def _validate_retrieval_top_k(cls, value: int) -> int:
         if value < 1 or value > 50:
             raise ValueError("retrieval_top_k must be between 1 and 50 inclusive.")
+        return value
+
+    @field_validator("pypi_base_url")
+    @classmethod
+    def _validate_pypi_base_url(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("pypi_base_url must not be empty.")
+
+        parsed = urlsplit(stripped)
+        if parsed.scheme not in _SUPPORTED_HTTP_SCHEMES:
+            raise ValueError("pypi_base_url must use http or https.")
+        if not parsed.hostname:
+            raise ValueError("pypi_base_url must include a hostname.")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("pypi_base_url must not include embedded credentials.")
+        if parsed.query or parsed.fragment:
+            raise ValueError("pypi_base_url must not include query or fragment components.")
+        if parsed.path not in ("", "/"):
+            raise ValueError("pypi_base_url must not include a path component.")
+
+        return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+
+    @field_validator("pypi_timeout_seconds")
+    @classmethod
+    def _validate_pypi_timeout_seconds(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("pypi_timeout_seconds must be greater than zero.")
         return value
 
     @field_validator("telegram_bot_token")

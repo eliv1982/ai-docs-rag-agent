@@ -12,6 +12,7 @@ from ai_docs_agent.models import (
     DocumentIndexingResult,
     GroundedAnswerResult,
     PineconeQueryMatch,
+    PyPIPackageInfo,
     RetrievalResult,
     RetrievedChunk,
     UrlProcessingResult,
@@ -262,6 +263,45 @@ def test_document_indexing_result_cleanup_not_requested_allows_none_status() -> 
     )
 
     assert result.old_versions_cleanup_succeeded is None
+
+
+# --- PyPIPackageInfo ---------------------------------------------------------
+
+
+def make_pypi_package_info(**overrides: Any) -> PyPIPackageInfo:
+    defaults: dict[str, Any] = {
+        "package_name": "httpx",
+        "latest_version": "0.0.0",
+        "summary": "HTTP client for Python.",
+        "requires_python": ">=3.8",
+        "pypi_url": "https://pypi.org/project/httpx/",
+        "project_url": "https://github.com/encode/httpx",
+    }
+    return PyPIPackageInfo(**{**defaults, **overrides})
+
+
+def test_pypi_package_info_accepts_required_and_optional_fields() -> None:
+    result = make_pypi_package_info()
+
+    assert result.package_name == "httpx"
+    assert result.project_url == "https://github.com/encode/httpx"
+
+
+def test_pypi_package_info_normalizes_blank_optional_fields_to_none() -> None:
+    result = make_pypi_package_info(summary="   ", requires_python="", project_url="  ")
+
+    assert result.summary is None
+    assert result.requires_python is None
+    assert result.project_url is None
+
+
+def test_pypi_package_info_rejects_blank_required_fields() -> None:
+    with pytest.raises(ValidationError):
+        make_pypi_package_info(package_name="   ")
+    with pytest.raises(ValidationError):
+        make_pypi_package_info(latest_version="")
+    with pytest.raises(ValidationError):
+        make_pypi_package_info(pypi_url="  ")
 
 
 def test_document_indexing_result_cleanup_requested_forbids_none_status() -> None:

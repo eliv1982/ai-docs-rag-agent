@@ -1,4 +1,4 @@
-"""Result and status models for Pinecone index operations and URL ingestion."""
+"""Typed result and status models used across the application's domain services."""
 
 from typing import Any, Literal
 
@@ -306,6 +306,35 @@ class RetrievalResult(BaseModel):
         if len(self.matches) > self.top_k:
             raise ValueError("matches length must not exceed top_k.")
         return self
+
+
+class PyPIPackageInfo(BaseModel):
+    """The typed result of one successful PyPI JSON API package lookup."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    package_name: str
+    latest_version: str
+    summary: str | None
+    requires_python: str | None
+    pypi_url: str
+    project_url: str | None
+
+    @field_validator("package_name", "latest_version", "pypi_url")
+    @classmethod
+    def _validate_required_non_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank.")
+        return stripped
+
+    @field_validator("summary", "requires_python", "project_url")
+    @classmethod
+    def _normalize_optional_string(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
 
 class AnswerSource(BaseModel):

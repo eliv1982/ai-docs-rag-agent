@@ -7,8 +7,9 @@ Telegram RAG-агент для работы с технической докум
 read-only semantic search (`RetrievalService.search`) + minimal grounded RAG answering
 (`DocumentationAnswerService.answer`) + short-term in-memory conversation memory
 (`ConversationAnswerService`) + minimal Telegram bot MVP (`TelegramBotService`,
-`python-telegram-bot`) implemented. Agent/tools (кроме Telegram-обёртки) ещё не
-реализованы.**
+`python-telegram-bot`) + typed read-only PyPI JSON lookup (`PyPILookupService`,
+`lookup_pypi_package`, `scripts/pypi_lookup.py`) implemented. LangChain agent routing
+ещё не реализована.**
 
 ## Планируемые возможности
 
@@ -19,7 +20,7 @@ read-only semantic search (`RetrievalService.search`) + minimal grounded RAG ans
 - хранение данных в Pinecone;
 - семантический поиск;
 - генерация grounded-ответов по найденному контексту;
-- обращение к PyPI через реальный GET API tool;
+- LangChain agent routing поверх уже реализованного PyPI lookup;
 - контролируемая пользовательская память;
 - интерфейс через Telegram.
 
@@ -30,9 +31,9 @@ Pinecone (`DocumentIndexingService.index_url`), типизированный rea
 по уже проиндексированным чанкам (`RetrievalService.search`, см. ниже), минимальный
 grounded RAG answering поверх retrieval (`DocumentationAnswerService.answer`, см. ниже),
 короткая process-local разговорная память по `session_id` (`ConversationAnswerService`, см.
-ниже), а также минимальный Telegram bot MVP (`TelegramBotService`, см. ниже) поверх того же
-`ConversationAnswerService`. LangChain agent и tools (кроме Telegram-обёртки) пока не
-реализованы.
+ниже), минимальный Telegram bot MVP (`TelegramBotService`, см. ниже) поверх того же
+`ConversationAnswerService`, а также typed read-only PyPI lookup (`PyPILookupService`,
+`lookup_pypi_package`, см. ниже). Полноценный LangChain agent routing пока не реализован.
 
 На данном этапе реализовано:
 
@@ -52,6 +53,9 @@ grounded RAG answering поверх retrieval (`DocumentationAnswerService.answe
 - минимальный grounded RAG answering (`DocumentationAnswerService.answer`): question →
   `RetrievalService.search` → grounded LLM prompt → одна text-ответ chat completion →
   `GroundedAnswerResult` с детерминированным списком источников (см. ниже);
+- типизированный read-only PyPI lookup (`PyPILookupService.lookup`, `lookup_pypi_package`,
+  см. ниже): package name → реальный GET `https://pypi.org/pypi/{package_name}/json` →
+  `PyPIPackageInfo` c безопасным domain error mapping;
 - короткая process-local разговорная память по `session_id` (`ConversationAnswerService`,
   `InMemoryConversationMemory`, см. ниже): последние сообщения диалога подставляются в промпт
   для continuity, но никогда не считаются документальным фактом;
@@ -59,8 +63,8 @@ grounded RAG answering поверх retrieval (`DocumentationAnswerService.answe
   `/start`, `/reset` и обычные текстовые вопросы поверх того же `ConversationAnswerService`
   (`chat_id` используется как `session_id`).
 
-Модуль `tools.py` по-прежнему содержит только module docstring. **Agent orchestration и
-tools (включая PyPI GET API tool) ещё не реализованы.**
+`tools.py` теперь содержит только тонкий typed adapter `lookup_pypi_package(...)` поверх
+`PyPILookupService`; полноценная LangChain agent orchestration по-прежнему не реализована.
 
 ### URL ingestion и chunking pipeline
 
@@ -326,6 +330,42 @@ python scripts/ask_docs.py "how do I configure the client?"
 python scripts/ask_docs.py "how do I configure the client?" --top-k 3 --namespace documentation
 ```
 
+### PyPI JSON lookup
+
+`src/ai_docs_agent/pypi.py` определяет `PyPILookupService.lookup(package_name) ->
+PyPIPackageInfo`, выполняющий один реальный read-only GET:
+
+```
+GET https://pypi.org/pypi/{package_name}/json
+```
+
+Сервис заранее валидирует package name (буквы/цифры/`-`/`_`/`.` допускаются; пустые,
+URL-like, query/path-injection и другие unsafe значения отклоняются до HTTP-запроса), затем
+делает один `httpx`-запрос с явным timeout и возвращает типизированный результат как минимум с
+полями:
+
+- `package_name` — canonical name, который вернул PyPI;
+- `latest_version`;
+- `summary` (`None`, если отсутствует/`null`);
+- `requires_python` (`None`, если отсутствует/`null`);
+- `pypi_url`;
+- `project_url` (`None`, если у пакета нет отдельного project/home URL).
+
+Поддерживаемые error categories: `invalid_package_name`, `package_not_found`, `timeout`,
+`network_error`, `malformed_response`, `upstream_http_error`. Публичный adapter
+`lookup_pypi_package(...)` в `src/ai_docs_agent/tools.py` — тонкая обёртка над этим сервисом;
+LangChain agent routing к нему пока не реализована.
+
+CLI для live read-only проверки:
+
+```
+python scripts/pypi_lookup.py httpx
+```
+
+Скрипт печатает стабильное summary с placeholder `not specified` для отсутствующих optional
+полей. Unit-тесты для сервиса/CLI используют только `httpx.MockTransport` и fake-сервисы — без
+реальных сетевых вызовов.
+
 ### Conversation memory
 
 `src/ai_docs_agent/memory.py` определяет короткую, **process-local** разговорную память,
@@ -528,6 +568,12 @@ error-сообщениях, логах, `repr()` или примерах в эт
   тестовый набор; тестируется только чистая функция форматирования (`format_answer_report`)
   и `main()` с внедрённым fake-сервисом. Exit code `0` — ответ получен успешно (в т.ч.
   fallback без контекста); `1` — домен/выполнение.
+- `scripts/pypi_lookup.py` — **live**-скрипт, выполняющий один реальный read-only GET к
+  PyPI JSON API (`/pypi/{package_name}/json`). Не требует OpenAI/Pinecone/Telegram ключей и не
+  изменяет внешнее состояние. Тестируется только через `main(service=fake_service)` и pure
+  formatting function `format_pypi_report`; unit-тесты используют только mocks/fakes. Exit code
+  `0` — lookup успешен; `1` — invalid input, package not found, network/upstream или malformed
+  response.
 - `scripts/run_telegram_bot.py` — **live**-скрипт: строит Telegram `Application`
   (`build_application()`) и запускает long polling (`Application.run_polling()`), блокируя
   процесс до остановки. Требует настоящих `TELEGRAM_BOT_TOKEN`/OpenAI/Pinecone ключей, не
@@ -618,6 +664,12 @@ python scripts/ask_docs.py "how do I configure the client?"
 python scripts/ask_docs.py "how do I configure the client?" --top-k 3 --namespace documentation
 ```
 
+## PyPI package lookup (live, read-only, без OpenAI/Pinecone)
+
+```
+python scripts/pypi_lookup.py httpx
+```
+
 ## Telegram bot (live, требует реальных TELEGRAM_BOT_TOKEN/OpenAI/Pinecone ключей)
 
 Запускает long polling и блокирует процесс до `Ctrl+C`:
@@ -632,7 +684,7 @@ python scripts/run_telegram_bot.py
 
 ## Planned improvements / Следующая версия
 
-Текущие ограничения этого этапа (Stage 4E — minimal Telegram bot MVP):
+Текущие ограничения этого этапа (Stage 4F — Telegram MVP + typed PyPI lookup):
 
 - разговорная память (`InMemoryConversationMemory`) — **process-local и не персистентная**:
   хранится только в памяти процесса (последние 10 сообщений на `session_id`, включая

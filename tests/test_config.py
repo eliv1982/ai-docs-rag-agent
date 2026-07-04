@@ -12,6 +12,7 @@ _REQUIRED: dict[str, Any] = {
     "openai_api_key": "sk-test-openai",
     "pinecone_api_key": "pc-test-key",
     "openai_chat_model": "gpt-4o-mini",
+    "telegram_bot_token": "test-telegram-token",
 }
 
 # All environment variable names AppSettings binds to, used to isolate tests
@@ -46,6 +47,7 @@ _ALL_SETTINGS_ENV_VARS = (
     "PINECONE_INDEX_VERIFY_POLL_INTERVAL_SECONDS",
     "PINECONE_REPLACE_OLD_SOURCE_VERSIONS",
     "RETRIEVAL_TOP_K",
+    "TELEGRAM_BOT_TOKEN",
 )
 
 
@@ -279,6 +281,7 @@ def test_retrieval_top_k_reads_from_environment_variable(
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
     monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-telegram-token")
     monkeypatch.setenv("RETRIEVAL_TOP_K", "12")
 
     settings = AppSettings(_env_file=None)
@@ -320,6 +323,7 @@ def test_openai_chat_model_reads_from_environment_variable(
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
     monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-telegram-token")
 
     settings = AppSettings(_env_file=None)
 
@@ -341,12 +345,67 @@ def test_rejects_blank_openai_chat_model() -> None:
         make_settings(openai_chat_model="   ")
 
 
+def test_telegram_bot_token_override_is_applied() -> None:
+    settings = make_settings(telegram_bot_token="custom-token-value")
+
+    assert settings.telegram_bot_token.get_secret_value() == "custom-token-value"
+
+
+def test_telegram_bot_token_is_secret_str_not_leaked_in_repr() -> None:
+    settings = make_settings(telegram_bot_token="super-secret-telegram-token")
+
+    assert isinstance(settings.telegram_bot_token, SecretStr)
+    assert "super-secret-telegram-token" not in repr(settings.telegram_bot_token)
+    assert "super-secret-telegram-token" not in str(settings)
+
+
+def test_telegram_bot_token_reads_from_environment_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in _ALL_SETTINGS_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
+    monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "env-telegram-token")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.telegram_bot_token.get_secret_value() == "env-telegram-token"
+
+
+def test_rejects_missing_telegram_bot_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _ALL_SETTINGS_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
+    monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
+
+
+def test_rejects_blank_telegram_bot_token() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(telegram_bot_token="   ")
+
+
+def test_other_validation_errors_do_not_leak_telegram_bot_token() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        make_settings(
+            telegram_bot_token="super-secret-telegram-value", pinecone_metric="euclidean"
+        )
+
+    assert "super-secret-telegram-value" not in str(exc_info.value)
+
+
 def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in _ALL_SETTINGS_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
     monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-telegram-token")
     # get_settings() reads AppSettings() with its default env_file=".env"; running
     # from an empty tmp_path ensures no real .env is ever read, even if one is
     # later added to the project root.

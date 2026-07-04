@@ -84,6 +84,8 @@ class AppSettings(BaseSettings):
 
     retrieval_top_k: int = Field(default=5, validation_alias="RETRIEVAL_TOP_K")
 
+    telegram_bot_token: SecretStr = Field(validation_alias="TELEGRAM_BOT_TOKEN")
+
     @field_validator("pinecone_dimension")
     @classmethod
     def _validate_dimension(cls, value: int) -> int:
@@ -231,6 +233,13 @@ class AppSettings(BaseSettings):
     def _validate_retrieval_top_k(cls, value: int) -> int:
         if value < 1 or value > 50:
             raise ValueError("retrieval_top_k must be between 1 and 50 inclusive.")
+        return value
+
+    @field_validator("telegram_bot_token")
+    @classmethod
+    def _validate_telegram_bot_token(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("telegram_bot_token must not be empty.")
         return value
 
     @model_validator(mode="after")

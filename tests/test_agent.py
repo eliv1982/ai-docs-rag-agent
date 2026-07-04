@@ -1,6 +1,7 @@
 """Unit tests for DocumentationAnswerService. Uses fake retrieval and chat clients
 only; no real network, OpenAI, or Pinecone calls."""
 
+import logging
 from typing import Any
 
 import pytest
@@ -13,12 +14,14 @@ from ai_docs_agent.agent import (
 )
 from ai_docs_agent.config import AppSettings
 from ai_docs_agent.models import ConversationMessage, RetrievalResult, RetrievedChunk
+from ai_docs_agent.observability import hash_session_id, request_logging_context
 from ai_docs_agent.retrieval import RetrievalError
 
 _REQUIRED: dict[str, Any] = {
     "openai_api_key": "sk-test-openai",
     "pinecone_api_key": "pc-test-key",
     "openai_chat_model": "gpt-4o-mini",
+    "telegram_bot_token": "test-telegram-token",
 }
 
 
@@ -60,9 +63,11 @@ class FakeRetrievalService:
         self,
         *,
         result: RetrievalResult | None = None,
+        results: list[RetrievalResult] | None = None,
         error: Exception | None = None,
     ) -> None:
         self._result = result
+        self._results = list(results) if results is not None else None
         self._error = error
         self.calls: list[tuple[str, int | None, str | None]] = []
 
@@ -72,6 +77,9 @@ class FakeRetrievalService:
         self.calls.append((query, top_k, namespace))
         if self._error is not None:
             raise self._error
+        if self._results is not None:
+            assert self._results, "FakeRetrievalService.search called more times than expected."
+            return self._results.pop(0)
         assert self._result is not None
         return self._result
 
@@ -83,9 +91,11 @@ class FakeChatClient:
         self,
         *,
         answer: str = "The API key is set via OPENAI_API_KEY.",
+        answers: list[str] | None = None,
         error: Exception | None = None,
     ) -> None:
         self._answer = answer
+        self._answers = list(answers) if answers is not None else None
         self._error = error
         self.calls: list[dict[str, str]] = []
 
@@ -95,6 +105,9 @@ class FakeChatClient:
         )
         if self._error is not None:
             raise self._error
+        if self._answers is not None:
+            assert self._answers, "FakeChatClient.complete called more times than expected."
+            return self._answers.pop(0)
         return self._answer
 
 
@@ -237,6 +250,150 @@ def test_empty_retrieval_fallback_is_stable_wording() -> None:
     assert result.answer == (
         "В базе знаний не найдено достаточно информации для ответа на этот вопрос."
     )
+
+
+def test_answer_logs_safe_request_diagnostics_for_grounded_answer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    chunk = make_chunk(
+        score=0.91,
+        text="LEAK_CHUNK_BODY sk-live-secret vector=[0.1,0.2,0.3]",
+    )
+    question = "What are text splitters used for in LangChain?"
+    retrieval = FakeRetrievalService(
+        result=make_retrieval_result(query=question, matches=(chunk,))
+    )
+    service, _retrieval, _chat = make_service(retrieval=retrieval)
+
+    with request_logging_context(session_id="chat-123456"):
+        with caplog.at_level(logging.INFO):
+            service.answer(question)
+
+    assert "session_hash=" + hash_session_id("chat-123456") in caplog.text
+    assert "question_length=46" in caplog.text
+    assert "raw_candidate_count=1" in caplog.text
+    assert "accepted_candidate_count=1" in caplog.text
+    assert "top_candidate_scores=[0.91]" in caplog.text
+    assert "outcome=grounded" in caplog.text
+    assert "score_threshold=0.25" in caplog.text
+    assert "chat-123456" not in caplog.text
+    assert question not in caplog.text
+    assert "LEAK_CHUNK_BODY" not in caplog.text
+    assert "sk-live-secret" not in caplog.text
+    assert "vector=[0.1,0.2,0.3]" not in caplog.text
+
+
+# --- minimum relevance score gate ---------------------------------------------------
+
+
+def test_low_relevance_matches_trigger_no_context_fallback_and_skip_chat_call() -> None:
+    chunk = make_chunk(score=0.0556)
+    retrieval = FakeRetrievalService(result=make_retrieval_result(matches=(chunk,)))
+    chat = FakeChatClient()
+    service, _retrieval, _chat = make_service(retrieval=retrieval, chat=chat)
+
+    result = service.answer("Как приготовить борщ?")
+
+    assert result.retrieved_chunk_count == 0
+    assert result.sources == ()
+    assert "не найдено" in result.answer
+    assert chat.calls == []
+
+
+def test_no_context_fallback_logs_candidate_and_threshold_info_safely(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    chunk = make_chunk(
+        score=0.0556,
+        text="LEAK_CHUNK_BODY should-not-appear",
+    )
+    question = "How do I configure the client?"
+    retrieval = FakeRetrievalService(
+        result=make_retrieval_result(query=question, matches=(chunk,))
+    )
+    service, _retrieval, _chat = make_service(retrieval=retrieval)
+
+    with request_logging_context(session_id="987654321"):
+        with caplog.at_level(logging.INFO):
+            result = service.answer(question)
+
+    assert result.retrieved_chunk_count == 0
+    assert "session_hash=" + hash_session_id("987654321") in caplog.text
+    assert "question_length=30" in caplog.text
+    assert "raw_candidate_count=1" in caplog.text
+    assert "accepted_candidate_count=0" in caplog.text
+    assert "top_candidate_scores=[0.0556]" in caplog.text
+    assert "score_threshold=0.25" in caplog.text
+    assert "outcome=no_context" in caplog.text
+    assert "987654321" not in caplog.text
+    assert question not in caplog.text
+    assert "LEAK_CHUNK_BODY" not in caplog.text
+
+
+def test_direct_retrieval_first_pass_uses_only_latest_question_even_with_alias_history() -> None:
+    history = (
+        make_message(
+            "user", "В этом диалоге называй RecursiveCharacterTextSplitter Резаком."
+        ),
+        make_message(
+            "assistant",
+            "Хорошо, в рамках текущего диалога буду называть "
+            "RecursiveCharacterTextSplitter Резаком.",
+        ),
+    )
+    retrieval = FakeRetrievalService(
+        results=[
+            make_retrieval_result(query="Для чего нужен Резак?", matches=()),
+            make_retrieval_result(
+                query="Для чего нужен RecursiveCharacterTextSplitter?",
+                matches=(make_chunk(score=0.58),),
+            ),
+        ]
+    )
+    chat = FakeChatClient(
+        answers=[
+            "Для чего нужен RecursiveCharacterTextSplitter?",
+            "Он нужен, чтобы рекурсивно разбивать текст.",
+        ]
+    )
+    service, _retrieval, _chat = make_service(retrieval=retrieval, chat=chat)
+
+    service.answer("Для чего нужен Резак?", history=history)
+
+    assert retrieval.calls[0] == ("Для чего нужен Резак?", None, None)
+    assert "RecursiveCharacterTextSplitter" not in retrieval.calls[0][0]
+
+
+def test_relevant_documentation_match_clears_the_relevance_gate() -> None:
+    chunk = make_chunk(score=0.6474)
+    retrieval = FakeRetrievalService(result=make_retrieval_result(matches=(chunk,)))
+    service, _retrieval, chat = make_service(retrieval=retrieval)
+
+    result = service.answer(
+        "Как RecursiveCharacterTextSplitter определяет, где разделять текст?"
+    )
+
+    assert result.retrieved_chunk_count == 1
+    assert chat.calls
+
+
+def test_relevance_gate_filters_only_the_low_score_chunks() -> None:
+    relevant = make_chunk(
+        chunk_id="rel", document_id="doc-rel", score=0.6, title="Relevant Page"
+    )
+    irrelevant = make_chunk(
+        chunk_id="irr", document_id="doc-irr", score=0.05, title="Irrelevant Page"
+    )
+    retrieval = FakeRetrievalService(result=make_retrieval_result(matches=(relevant, irrelevant)))
+    service, _retrieval, chat = make_service(retrieval=retrieval)
+
+    result = service.answer("query")
+
+    assert result.retrieved_chunk_count == 1
+    assert result.sources[0].title == "Relevant Page"
+    prompt = chat.calls[0]["user_prompt"]
+    assert "Relevant Page" in prompt
+    assert "Irrelevant Page" not in prompt
 
 
 # --- sources -----------------------------------------------------------------------
@@ -433,6 +590,267 @@ def test_system_prompt_states_documentation_is_sole_factual_source() -> None:
     assert "not documentation evidence" in system_prompt
     assert "sole factual source" in system_prompt
     assert "verified documentation fact" in system_prompt
+
+
+def test_system_prompt_instructs_answering_current_message_only() -> None:
+    service, _retrieval, chat = make_service()
+
+    service.answer("query")
+
+    system_prompt = chat.calls[0]["system_prompt"].lower()
+    assert "current user message" in system_prompt
+    assert "the only message you must" in system_prompt
+    assert "do not repeat, continue, or restate a previous answer" in system_prompt
+
+
+def test_system_prompt_instructs_acknowledging_conversational_messages() -> None:
+    service, _retrieval, chat = make_service()
+
+    service.answer("query")
+
+    system_prompt = chat.calls[0]["system_prompt"].lower()
+    assert "conversational instruction" in system_prompt
+    assert "naming/alias request" in system_prompt
+    assert "acknowledge it briefly" in system_prompt
+    assert "instead of summarizing the documentation context" in system_prompt
+
+
+def test_current_message_is_placed_after_history_and_context() -> None:
+    history = (make_message("user", "HISTORY_MARKER"),)
+    chunk = make_chunk(text="Some text about CONTEXT_MARKER here.")
+    retrieval = FakeRetrievalService(
+        result=make_retrieval_result(query="CURRENT_MESSAGE_MARKER", matches=(chunk,))
+    )
+    service, _retrieval, chat = make_service(retrieval=retrieval)
+
+    service.answer("anything", history=history)
+
+    prompt = chat.calls[0]["user_prompt"]
+    assert prompt.index("HISTORY_MARKER") < prompt.index("CONTEXT_MARKER")
+    assert prompt.index("CONTEXT_MARKER") < prompt.index("CURRENT_MESSAGE_MARKER")
+
+
+def test_contextual_retry_runs_after_direct_no_context_result_when_history_exists() -> None:
+    history = (
+        make_message(
+            "user", "В этом диалоге называй RecursiveCharacterTextSplitter Резаком."
+        ),
+        make_message(
+            "assistant",
+            "Хорошо, в рамках текущего диалога буду называть "
+            "RecursiveCharacterTextSplitter Резаком.",
+        ),
+    )
+    splitter_chunk = make_chunk(
+        score=0.61,
+        title="Splitting recursively - Text splitter integration guide - Docs by LangChain",
+        final_url="https://docs.langchain.com/oss/python/integrations/splitters/recursive_text_splitter",
+        source_url="https://docs.langchain.com/oss/python/integrations/splitters/recursive_text_splitter",
+        document_id="langchain-splitter-doc",
+        text="RecursiveCharacterTextSplitter recursively splits text until chunks fit.",
+    )
+    retrieval = FakeRetrievalService(
+        results=[
+            make_retrieval_result(query="Для чего нужен Резак?", matches=()),
+            make_retrieval_result(
+                query="Для чего нужен RecursiveCharacterTextSplitter?",
+                matches=(splitter_chunk,),
+            ),
+        ]
+    )
+    chat = FakeChatClient(
+        answers=[
+            "Для чего нужен RecursiveCharacterTextSplitter?",
+            "Он нужен, чтобы рекурсивно разбивать текст на части подходящего размера.",
+        ]
+    )
+    service, _retrieval, _chat = make_service(retrieval=retrieval, chat=chat)
+
+    result = service.answer("Для чего нужен Резак?", history=history)
+
+    assert retrieval.calls == [
+        ("Для чего нужен Резак?", None, None),
+        ("Для чего нужен RecursiveCharacterTextSplitter?", None, None),
+    ]
+    assert len(chat.calls) == 2
+    assert result.question == "Для чего нужен Резак?"
+    assert result.retrieved_chunk_count == 1
+    assert result.sources[0].url == (
+        "https://docs.langchain.com/oss/python/integrations/splitters/recursive_text_splitter"
+    )
+    assert result.sources[0].title.startswith("Splitting recursively")
+
+
+def test_contextual_retry_preserves_grounding_and_never_uses_history_as_source() -> None:
+    history = (
+        make_message(
+            "user", "В этом диалоге называй RecursiveCharacterTextSplitter Резаком."
+        ),
+        make_message("assistant", "Хорошо, буду называть его Резаком."),
+    )
+    splitter_chunk = make_chunk(
+        score=0.58,
+        title="Recursive Splitter Docs",
+        final_url="https://docs.example.com/recursive-splitter",
+        source_url="https://docs.example.com/recursive-splitter",
+        document_id="doc-splitter",
+        text="RecursiveCharacterTextSplitter splits long text recursively by separators.",
+    )
+    retrieval = FakeRetrievalService(
+        results=[
+            make_retrieval_result(query="Для чего нужен Резак?", matches=()),
+            make_retrieval_result(
+                query="Для чего нужен RecursiveCharacterTextSplitter?",
+                matches=(splitter_chunk,),
+            ),
+        ]
+    )
+    chat = FakeChatClient(
+        answers=[
+            "Для чего нужен RecursiveCharacterTextSplitter?",
+            "Он нужен, чтобы разбивать длинный текст на части.",
+        ]
+    )
+    service, _retrieval, _chat = make_service(retrieval=retrieval, chat=chat)
+
+    result = service.answer("Для чего нужен Резак?", history=history)
+
+    assert result.answer == "Он нужен, чтобы разбивать длинный текст на части."
+    assert len(result.sources) == 1
+    assert result.sources[0].title == "Recursive Splitter Docs"
+    assert "Резак" not in result.sources[0].title
+    assert "Резак" not in result.sources[0].url
+
+
+def test_contextual_retry_uses_history_augmented_query_when_rewrite_is_unchanged() -> None:
+    history = (
+        make_message(
+            "user", "В этом диалоге называй RecursiveCharacterTextSplitter Резаком."
+        ),
+        make_message(
+            "assistant",
+            "Хорошо, в рамках текущего диалога буду называть "
+            "RecursiveCharacterTextSplitter Резаком.",
+        ),
+    )
+    retrieval = FakeRetrievalService(
+        results=[
+            make_retrieval_result(query="Для чего нужен Резак?", matches=()),
+            make_retrieval_result(
+                query=(
+                    "Current documentation question:\n"
+                    "Для чего нужен Резак?\n\n"
+                    "Recent conversation for reference resolution:\n"
+                    "[user] В этом диалоге называй RecursiveCharacterTextSplitter Резаком.\n"
+                    "[assistant] Хорошо, в рамках текущего диалога буду называть "
+                    "RecursiveCharacterTextSplitter Резаком."
+                ),
+                matches=(make_chunk(score=0.61),),
+            ),
+        ]
+    )
+    chat = FakeChatClient(
+        answers=[
+            "Для чего нужен Резак?",
+            "Он нужен, чтобы рекурсивно разбивать текст на части.",
+        ]
+    )
+    service, _retrieval, _chat = make_service(retrieval=retrieval, chat=chat)
+
+    result = service.answer("Для чего нужен Резак?", history=history)
+
+    assert retrieval.calls[0] == ("Для чего нужен Резак?", None, None)
+    assert len(retrieval.calls) == 2
+    assert "RecursiveCharacterTextSplitter" in retrieval.calls[1][0]
+    assert "[user]" in retrieval.calls[1][0]
+    assert result.retrieved_chunk_count == 1
+    assert result.question == "Для чего нужен Резак?"
+
+
+def test_direct_retrieval_success_skips_contextual_retry_even_with_history() -> None:
+    history = (make_message("user", "Назовем библиотеку коротко."),)
+    retrieval = FakeRetrievalService(
+        result=make_retrieval_result(
+            query="Что делает RecursiveCharacterTextSplitter?",
+            matches=(make_chunk(score=0.64),),
+        )
+    )
+    chat = FakeChatClient(answer="Он рекурсивно разбивает текст.")
+    service, _retrieval, _chat = make_service(retrieval=retrieval, chat=chat)
+
+    result = service.answer("Что делает RecursiveCharacterTextSplitter?", history=history)
+
+    assert retrieval.calls == [("Что делает RecursiveCharacterTextSplitter?", None, None)]
+    assert len(chat.calls) == 1
+    assert result.retrieved_chunk_count == 1
+
+
+def test_contextual_retry_logs_only_safe_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    history = (
+        make_message(
+            "user", "LEAK_ALIAS В этом диалоге называй RecursiveCharacterTextSplitter Резаком."
+        ),
+        make_message("assistant", "LEAK_ALIAS_ACK Хорошо, буду называть его Резаком."),
+    )
+    splitter_chunk = make_chunk(
+        score=0.58,
+        title="Recursive Splitter Docs",
+        final_url="https://docs.example.com/recursive-splitter",
+        source_url="https://docs.example.com/recursive-splitter",
+        document_id="doc-splitter",
+        text="LEAK_CHUNK_BODY RecursiveCharacterTextSplitter splits long text.",
+    )
+    retrieval = FakeRetrievalService(
+        results=[
+            make_retrieval_result(query="Для чего нужен Резак?", matches=()),
+            make_retrieval_result(
+                query="Для чего нужен RecursiveCharacterTextSplitter?",
+                matches=(splitter_chunk,),
+            ),
+        ]
+    )
+    chat = FakeChatClient(
+        answers=[
+            "Для чего нужен RecursiveCharacterTextSplitter?",
+            "Он нужен, чтобы разбивать длинный текст на части.",
+        ]
+    )
+    service, _retrieval, _chat = make_service(retrieval=retrieval, chat=chat)
+
+    with request_logging_context(session_id="chat-424242"):
+        with caplog.at_level(logging.INFO):
+            service.answer("Для чего нужен Резак?", history=history)
+
+    assert "session_hash=" + hash_session_id("chat-424242") in caplog.text
+    assert "retrieval_pass=direct" in caplog.text
+    assert "retrieval_pass=contextual" in caplog.text
+    assert "query_length=" in caplog.text
+    assert "raw_candidate_count=0" in caplog.text
+    assert "accepted_candidate_count=1" in caplog.text
+    assert "LEAK_ALIAS" not in caplog.text
+    assert "LEAK_ALIAS_ACK" not in caplog.text
+    assert "Для чего нужен Резак?" not in caplog.text
+    assert "chat-424242" not in caplog.text
+    assert "LEAK_CHUNK_BODY" not in caplog.text
+
+
+def test_conversational_message_can_be_acknowledged_without_documentation_summary() -> None:
+    chunk = make_chunk(score=0.55)
+    retrieval = FakeRetrievalService(result=make_retrieval_result(matches=(chunk,)))
+    acknowledgement = (
+        "Хорошо, в рамках текущего диалога буду называть "
+        "RecursiveCharacterTextSplitter «Резак»."
+    )
+    chat = FakeChatClient(answer=acknowledgement)
+    service, _retrieval, _chat = make_service(retrieval=retrieval, chat=chat)
+
+    result = service.answer(
+        "В этом диалоге будем называть RecursiveCharacterTextSplitter «Резак»."
+    )
+
+    assert result.answer == acknowledgement
 
 
 def test_sources_are_unaffected_by_history() -> None:

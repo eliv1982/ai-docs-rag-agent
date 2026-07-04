@@ -42,6 +42,7 @@ _REQUIRED: dict[str, Any] = {
     "pinecone_api_key": "pc-test-key",
     "openai_chat_model": "gpt-4o-mini",
     "telegram_bot_token": "test-telegram-token",
+    "user_memory_hash_secret": "unit-test-user-memory-secret",
 }
 
 
@@ -852,11 +853,13 @@ def test_build_application_fails_concisely_on_missing_configuration(
         "PINECONE_API_KEY",
         "OPENAI_CHAT_MODEL",
         "TELEGRAM_BOT_TOKEN",
+        "USER_MEMORY_HASH_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
     monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("USER_MEMORY_HASH_SECRET", "env-user-memory-secret")
     # TELEGRAM_BOT_TOKEN intentionally left unset to exercise the failure path.
     monkeypatch.chdir(tmp_path)
     get_settings.cache_clear()

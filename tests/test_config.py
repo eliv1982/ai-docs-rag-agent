@@ -13,6 +13,7 @@ _REQUIRED: dict[str, Any] = {
     "pinecone_api_key": "pc-test-key",
     "openai_chat_model": "gpt-4o-mini",
     "telegram_bot_token": "test-telegram-token",
+    "user_memory_hash_secret": "unit-test-user-memory-secret",
 }
 
 # All environment variable names AppSettings binds to, used to isolate tests
@@ -50,6 +51,11 @@ _ALL_SETTINGS_ENV_VARS = (
     "PYPI_BASE_URL",
     "PYPI_TIMEOUT_SECONDS",
     "TELEGRAM_BOT_TOKEN",
+    "USER_MEMORY_HASH_SECRET",
+    "USER_MEMORY_NAMESPACE_PREFIX",
+    "USER_MEMORY_TOP_K",
+    "USER_MEMORY_SCORE_THRESHOLD",
+    "USER_MEMORY_MAX_STATEMENT_LENGTH",
 )
 
 
@@ -88,6 +94,10 @@ def test_defaults() -> None:
     assert settings.retrieval_top_k == 5
     assert settings.pypi_base_url == "https://pypi.org"
     assert settings.pypi_timeout_seconds == 10
+    assert settings.user_memory_namespace_prefix == "user-memory"
+    assert settings.user_memory_top_k == 5
+    assert settings.user_memory_score_threshold == 0.35
+    assert settings.user_memory_max_statement_length == 500
 
 
 def test_overrides_are_applied() -> None:
@@ -329,6 +339,7 @@ def test_retrieval_top_k_reads_from_environment_variable(
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
     monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-telegram-token")
+    monkeypatch.setenv("USER_MEMORY_HASH_SECRET", "env-user-memory-secret")
     monkeypatch.setenv("RETRIEVAL_TOP_K", "12")
 
     settings = AppSettings(_env_file=None)
@@ -371,6 +382,7 @@ def test_openai_chat_model_reads_from_environment_variable(
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
     monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-telegram-token")
+    monkeypatch.setenv("USER_MEMORY_HASH_SECRET", "env-user-memory-secret")
 
     settings = AppSettings(_env_file=None)
 
@@ -382,6 +394,8 @@ def test_rejects_missing_openai_chat_model(monkeypatch: pytest.MonkeyPatch) -> N
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-telegram-token")
+    monkeypatch.setenv("USER_MEMORY_HASH_SECRET", "env-user-memory-secret")
 
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
@@ -415,6 +429,7 @@ def test_telegram_bot_token_reads_from_environment_variable(
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
     monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "env-telegram-token")
+    monkeypatch.setenv("USER_MEMORY_HASH_SECRET", "env-user-memory-secret")
 
     settings = AppSettings(_env_file=None)
 
@@ -427,6 +442,7 @@ def test_rejects_missing_telegram_bot_token(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
     monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("USER_MEMORY_HASH_SECRET", "env-user-memory-secret")
 
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
@@ -453,6 +469,7 @@ def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
     monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-telegram-token")
+    monkeypatch.setenv("USER_MEMORY_HASH_SECRET", "env-user-memory-secret")
     # get_settings() reads AppSettings() with its default env_file=".env"; running
     # from an empty tmp_path ensures no real .env is ever read, even if one is
     # later added to the project root.
@@ -465,3 +482,76 @@ def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
         assert first is second
     finally:
         get_settings.cache_clear()
+
+
+def test_rejects_missing_user_memory_hash_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _ALL_SETTINGS_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
+    monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-telegram-token")
+
+    with pytest.raises(ValidationError) as exc_info:
+        AppSettings(_env_file=None)
+
+    assert "USER_MEMORY_HASH_SECRET" in str(exc_info.value)
+
+
+def test_rejects_blank_user_memory_hash_secret() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_hash_secret="   ")
+
+
+def test_user_memory_hash_secret_is_secret_str_not_leaked_in_repr() -> None:
+    settings = make_settings(user_memory_hash_secret="super-secret-memory-pepper")
+
+    assert isinstance(settings.user_memory_hash_secret, SecretStr)
+    assert "super-secret-memory-pepper" not in repr(settings.user_memory_hash_secret)
+    assert "super-secret-memory-pepper" not in str(settings)
+
+
+def test_rejects_blank_user_memory_namespace_prefix() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_namespace_prefix="   ")
+
+
+def test_rejects_user_memory_namespace_prefix_with_unsafe_characters() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_namespace_prefix="user memory")
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_namespace_prefix="память")
+
+
+def test_rejects_user_memory_namespace_prefix_over_40_characters() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_namespace_prefix="p" * 41)
+
+
+def test_rejects_user_memory_namespace_prefix_equal_to_documents_namespace() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(
+            pinecone_documents_namespace="documentation",
+            user_memory_namespace_prefix="documentation",
+        )
+
+
+def test_rejects_user_memory_top_k_out_of_range() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_top_k=0)
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_top_k=51)
+
+
+def test_rejects_user_memory_score_threshold_out_of_cosine_range() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_score_threshold=1.5)
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_score_threshold=-1.5)
+
+
+def test_rejects_user_memory_max_statement_length_out_of_range() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_max_statement_length=0)
+    with pytest.raises(ValidationError):
+        make_settings(user_memory_max_statement_length=4001)

@@ -47,6 +47,8 @@ _ALL_SETTINGS_ENV_VARS = (
     "PINECONE_INDEX_VERIFY_POLL_INTERVAL_SECONDS",
     "PINECONE_REPLACE_OLD_SOURCE_VERSIONS",
     "RETRIEVAL_TOP_K",
+    "PYPI_BASE_URL",
+    "PYPI_TIMEOUT_SECONDS",
     "TELEGRAM_BOT_TOKEN",
 )
 
@@ -84,6 +86,8 @@ def test_defaults() -> None:
     assert settings.pinecone_index_verify_poll_interval_seconds == 1
     assert settings.pinecone_replace_old_source_versions is True
     assert settings.retrieval_top_k == 5
+    assert settings.pypi_base_url == "https://pypi.org"
+    assert settings.pypi_timeout_seconds == 10
 
 
 def test_overrides_are_applied() -> None:
@@ -257,6 +261,49 @@ def test_rejects_non_positive_index_verify_timeout() -> None:
 def test_rejects_non_positive_index_verify_poll_interval() -> None:
     with pytest.raises(ValidationError):
         make_settings(pinecone_index_verify_poll_interval_seconds=0)
+
+
+def test_pypi_base_url_is_stripped_and_trailing_slash_is_removed() -> None:
+    settings = make_settings(pypi_base_url="  https://pypi.org/  ")
+
+    assert settings.pypi_base_url == "https://pypi.org"
+
+
+def test_rejects_blank_pypi_base_url() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pypi_base_url="   ")
+
+
+def test_rejects_pypi_base_url_with_non_http_scheme() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pypi_base_url="ftp://pypi.org")
+
+
+def test_rejects_pypi_base_url_without_hostname() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pypi_base_url="https:///missing-host")
+
+
+def test_rejects_pypi_base_url_with_credentials() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pypi_base_url="https://user:pass@pypi.org")
+
+
+def test_rejects_pypi_base_url_with_query_or_fragment() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pypi_base_url="https://pypi.org?x=1")
+    with pytest.raises(ValidationError):
+        make_settings(pypi_base_url="https://pypi.org#frag")
+
+
+def test_rejects_pypi_base_url_with_path() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pypi_base_url="https://pypi.org/simple")
+
+
+def test_rejects_non_positive_pypi_timeout_seconds() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(pypi_timeout_seconds=0)
 
 
 def test_rejects_index_verify_poll_interval_greater_than_timeout() -> None:

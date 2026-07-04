@@ -1,5 +1,6 @@
 """Typed application configuration loaded from environment variables."""
 
+import re
 from functools import lru_cache
 from urllib.parse import urlsplit
 
@@ -8,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _SUPPORTED_METRICS = frozenset({"cosine"})
 _SUPPORTED_HTTP_SCHEMES = frozenset({"http", "https"})
+_NAMESPACE_PREFIX_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
 
 
 class AppSettings(BaseSettings):
@@ -89,6 +91,18 @@ class AppSettings(BaseSettings):
     pypi_timeout_seconds: float = Field(default=10, validation_alias="PYPI_TIMEOUT_SECONDS")
 
     telegram_bot_token: SecretStr = Field(validation_alias="TELEGRAM_BOT_TOKEN")
+
+    user_memory_hash_secret: SecretStr = Field(validation_alias="USER_MEMORY_HASH_SECRET")
+    user_memory_namespace_prefix: str = Field(
+        default="user-memory", validation_alias="USER_MEMORY_NAMESPACE_PREFIX"
+    )
+    user_memory_top_k: int = Field(default=5, validation_alias="USER_MEMORY_TOP_K")
+    user_memory_score_threshold: float = Field(
+        default=0.35, validation_alias="USER_MEMORY_SCORE_THRESHOLD"
+    )
+    user_memory_max_statement_length: int = Field(
+        default=500, validation_alias="USER_MEMORY_MAX_STATEMENT_LENGTH"
+    )
 
     @field_validator("pinecone_dimension")
     @classmethod
@@ -273,6 +287,62 @@ class AppSettings(BaseSettings):
         if not value.get_secret_value().strip():
             raise ValueError("telegram_bot_token must not be empty.")
         return value
+
+    @field_validator("user_memory_hash_secret")
+    @classmethod
+    def _validate_user_memory_hash_secret(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("user_memory_hash_secret must not be empty.")
+        return value
+
+    @field_validator("user_memory_namespace_prefix")
+    @classmethod
+    def _validate_user_memory_namespace_prefix(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("user_memory_namespace_prefix must not be empty.")
+        if not _NAMESPACE_PREFIX_PATTERN.fullmatch(stripped):
+            raise ValueError(
+                "user_memory_namespace_prefix may contain only ASCII letters, digits, "
+                "'.', '_' and '-'."
+            )
+        if len(stripped) > 40:
+            raise ValueError("user_memory_namespace_prefix must not exceed 40 characters.")
+        return stripped
+
+    @field_validator("user_memory_top_k")
+    @classmethod
+    def _validate_user_memory_top_k(cls, value: int) -> int:
+        if value < 1 or value > 50:
+            raise ValueError("user_memory_top_k must be between 1 and 50 inclusive.")
+        return value
+
+    @field_validator("user_memory_score_threshold")
+    @classmethod
+    def _validate_user_memory_score_threshold(cls, value: float) -> float:
+        if value < -1.0 or value > 1.0:
+            raise ValueError(
+                "user_memory_score_threshold must be between -1.0 and 1.0 inclusive "
+                "(cosine similarity range)."
+            )
+        return value
+
+    @field_validator("user_memory_max_statement_length")
+    @classmethod
+    def _validate_user_memory_max_statement_length(cls, value: int) -> int:
+        if value < 1 or value > 4000:
+            raise ValueError(
+                "user_memory_max_statement_length must be between 1 and 4000 inclusive."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_memory_namespace_prefix_not_documents_namespace(self) -> "AppSettings":
+        if self.user_memory_namespace_prefix == self.pinecone_documents_namespace:
+            raise ValueError(
+                "user_memory_namespace_prefix must differ from pinecone_documents_namespace."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_poll_interval_within_timeout(self) -> "AppSettings":

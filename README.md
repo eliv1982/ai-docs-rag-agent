@@ -9,8 +9,9 @@ read-only semantic search (`RetrievalService.search`) + minimal grounded RAG ans
 (`ConversationAnswerService`) + minimal Telegram bot MVP (`TelegramBotService`,
 `python-telegram-bot`) + typed read-only PyPI JSON lookup (`PyPILookupService`,
 `lookup_pypi_package`, `scripts/pypi_lookup.py`) + real LangChain tool-calling agent
-(`LangChainToolCallingAgent`, `scripts/ask_agent.py`) implemented. Telegram integration of
-the new agent and vector memory are not implemented yet.**
+(`LangChainToolCallingAgent`, `scripts/ask_agent.py`) + controlled long-term user vector
+memory in Pinecone (`UserMemoryService`, `scripts/user_memory.py`) implemented. Telegram
+integration of the new agent and of the long-term memory is not implemented yet.**
 
 ## Планируемые возможности
 
@@ -469,6 +470,104 @@ second = conversation.answer("session-123", "How do I configure it?")  # "it" re
 conversation.reset("session-123")  # clears only this session's history
 ```
 
+### Long-term user memory (Stage 4H)
+
+`src/ai_docs_agent/user_memory.py` определяет `UserMemoryService` — контролируемую
+персистентную пользовательскую память в Pinecone:
+
+```
+remember(user_identifier, statement) →
+HMAC-SHA256 pseudonymous identity → per-user namespace →
+dedup check (deterministic record ID) → OpenAI embedding → Pinecone upsert
+
+recall(user_identifier, query) →
+та же identity/namespace → OpenAI query embedding →
+Pinecone query только в namespace этого пользователя →
+top_k + score threshold → typed matches, отсортированные по score
+```
+
+**Запись только явная (explicit-write-only).** Память пишется только через явный вызов
+`remember(...)` (или CLI-команду ниже). Обычные сообщения, вопросы и ответы по документации
+**никогда не сохраняются автоматически**. Детерминированный парсер
+`parse_remember_command(text)` распознаёт только осознанную команду вида
+`Запомни: в примерах я предпочитаю httpx.` (также `Remember: ...`; регистронезависимо,
+двоеточие обязательно) и возвращает `None` для любых обычных фраз («Я использую httpx.»,
+«Расскажи про httpx.» и т.п.). Парсер отделён от Pinecone-персистентности: он только
+извлекает текст, а решение о записи принимает вызывающий код через `remember(...)`.
+
+**Псевдонимная identity (HMAC).** Raw-идентификатор пользователя (например, Telegram chat
+ID) никогда не сохраняется в Pinecone (ни в записи, ни в метаданных, ни в ID), не пишется в
+логи и не возвращается в результатах. Identity выводится как
+`HMAC-SHA256(USER_MEMORY_HASH_SECRET, raw_identifier)` — не простой unsalted hash.
+`USER_MEMORY_HASH_SECRET` — обязательный отдельный секрет (`SecretStr`); он не derived из
+`TELEGRAM_BOT_TOKEN`/`OPENAI_API_KEY`/`PINECONE_API_KEY`, поэтому ротация любого из этих
+токенов не меняет memory identity. **Ротация самого `USER_MEMORY_HASH_SECRET` меняет все
+derived namespaces: ранее записанная память становится недостижимой через новую identity**
+(старые записи остаются в старых namespaces, но больше никогда не запрашиваются).
+
+**Один namespace на пользователя.** Namespace = `user-memory-<первые 32 hex-символа
+digest>` (`USER_MEMORY_NAMESPACE_PREFIX` настраивается; длина ограничена; для одного
+идентификатора и секрета — детерминирован; raw-идентификатор из namespace не
+восстанавливается). Каждый remember/recall всегда явно указывает derived namespace этого
+пользователя; documentation namespace никогда не читается и не изменяется memory-сервисом
+(prefix обязан отличаться от `PINECONE_DOCUMENTS_NAMESPACE` — проверяется на границе
+конфигурации). В логи попадает только сокращённый digest (12 символов), не raw ID и не
+полный digest.
+
+**Дедупликация / content hash.** Content hash = SHA-256 от нормализованной формы statement
+(Unicode NFC → casefold → схлопывание пробельных последовательностей → strip). Record ID
+детерминирован: `memory-<первые 32 hex-символа content hash>`. Повторный remember того же
+нормализованного текста адресует ту же запись, не создаёт дубликата и возвращает typed
+статус `duplicate` (первая запись — `created`); дедупликация проверяется fetch'ем по ID
+**до** создания embedding (повторный remember не тратит embedding-вызов). Одинаковый текст
+у разных пользователей остаётся изолированным в разных namespaces. Human-readable текст
+сохраняется как есть (только strip краёв), нормализация используется только для
+валидации/хеширования. Model-based semantic dedup на этом этапе сознательно не выполняется.
+
+**Валидация statement.** До embedding/записи отклоняются: пустой/whitespace-only текст,
+текст только из command prefix, control-символы (кроме `\t`/`\n`/`\r`), текст длиннее
+`USER_MEMORY_MAX_STATEMENT_LENGTH` (по умолчанию 500 символов). Unicode/русский текст
+сохраняется без искажения.
+
+**Recall.** Запрос embed'ится ровно один раз и выполняется только в namespace этого
+пользователя с фильтром `{"kind": {"$eq": "user_memory"}}`, `top_k =
+USER_MEMORY_TOP_K` (по умолчанию 5) и порогом `USER_MEMORY_SCORE_THRESHOLD` (по умолчанию
+0.35 — значение нужно валидировать под выбранную embedding-модель и metric индекса;
+текущая конфигурация — `text-embedding-3-small` + cosine). Кандидаты ниже порога
+отбрасываются; результат — `UserMemoryRecallResult` с matches, отсортированными по score,
+и безопасным пустым состоянием (`found=false`), если ничего не прошло порог. Другой
+пользователь тот же факт не получает — его namespace другой.
+
+**Метаданные записи** — плоские, без вложенных объектов: `kind`, `text`, `content_hash`,
+`schema_version`, `created_at` (UTC ISO-8601). Не сохраняются: raw user ID, chat ID,
+username, телефон, API-ключи, транскрипт диалога, ответы ассистента, document chunks.
+
+**Ошибки** — typed: `InvalidUserIdentifierError`, `InvalidMemoryStatementError`,
+`MemoryIdentityConfigurationError`, `MemoryEmbeddingError`, `MemoryStorageError`,
+`MemoryRecallError`, `MalformedMemoryRecordError` (все наследуют `UserMemoryError`).
+
+**Privacy-safe observability.** Логи содержат только: короткий identity digest, операцию
+(remember/recall), длину statement/query, статус created/duplicate, raw/accepted counts,
+top scores, elapsed time и безопасную категорию сбоя. Никогда не логируются: raw user ID,
+текст statement/query/памяти, embeddings, ключи, `USER_MEMORY_HASH_SECRET`, полный digest.
+
+**Интеграция с Telegram/агентом — следующий этап (Stage 4I).** Telegram-бот и LangChain
+agent пока не читают и не пишут долговременную память; обычная переписка в Telegram
+по-прежнему нигде персистентно не сохраняется. Команда `/reset` в Telegram очищает только
+короткую process-local разговорную память и **не будет удалять долговременную память и
+после интеграции** — управление долговременной памятью станет отдельной операцией.
+
+CLI (live, требует реальных OpenAI/Pinecone ключей и `USER_MEMORY_HASH_SECRET`):
+
+```
+python scripts/user_memory.py remember stage4h-demo-user "В примерах я предпочитаю httpx."
+python scripts/user_memory.py recall stage4h-demo-user "Какую HTTP-библиотеку я предпочитаю?"
+```
+
+Exit codes: `0` — успешная запись, `duplicate` или безопасный пустой recall; `1` —
+невалидная конфигурация/ввод или инфраструктурный сбой (без traceback для ожидаемых
+domain-ошибок). CLI не печатает raw namespace, полный digest и секреты.
+
 ### Telegram bot
 
 `src/ai_docs_agent/telegram_bot.py` определяет минимальный Telegram MVP поверх
@@ -635,6 +734,13 @@ error-сообщениях, логах, `repr()` или примерах в эт
   formatting function `format_pypi_report`; unit-тесты используют только mocks/fakes. Exit code
   `0` — lookup успешен; `1` — invalid input, package not found, network/upstream или malformed
   response.
+- `scripts/user_memory.py` — **live**-скрипт долговременной памяти: выполняет реальные
+  вызовы OpenAI (embedding) и Pinecone (fetch/upsert/query) только в derived
+  per-user namespace. Требует настоящих ключей и `USER_MEMORY_HASH_SECRET`, не входит в
+  автоматический тестовый набор; unit-тесты используют только внедрённый fake-сервис
+  (`main(argv, service=fake)`) и чистые функции форматирования. Exit codes: `0` —
+  успешная запись/`duplicate`/безопасный пустой recall; `1` — невалидный ввод/конфигурация
+  или инфраструктурный сбой.
 - `scripts/run_telegram_bot.py` — **live**-скрипт: строит Telegram `Application`
   (`build_application()`) и запускает long polling (`Application.run_polling()`), блокируя
   процесс до остановки. Требует настоящих `TELEGRAM_BOT_TOKEN`/OpenAI/Pinecone ключей, не
@@ -738,6 +844,15 @@ python scripts/ask_agent.py "Какая последняя версия паке
 python scripts/ask_agent.py "Что такое embeddings в OpenAI API?"
 ```
 
+## Long-term user memory CLI (live, требует реальных OpenAI/Pinecone ключей и USER_MEMORY_HASH_SECRET)
+
+```
+python scripts/user_memory.py remember stage4h-demo-user "В примерах я предпочитаю httpx."
+python scripts/user_memory.py recall stage4h-demo-user "Какую HTTP-библиотеку я предпочитаю?"
+```
+
+Запись выполняется только этой явной операцией; обычные вопросы/диалог ничего не сохраняют.
+
 ## Telegram bot (live, требует реальных TELEGRAM_BOT_TOKEN/OpenAI/Pinecone ключей)
 
 Запускает long polling и блокирует процесс до `Ctrl+C`:
@@ -752,7 +867,7 @@ python scripts/run_telegram_bot.py
 
 ## Planned improvements / Следующая версия
 
-Текущие ограничения этого этапа (Stage 4G — LangChain tool-calling agent):
+Текущие ограничения этого этапа (Stage 4H — long-term user vector memory):
 
 - разговорная память (`InMemoryConversationMemory`) — **process-local и не персистентная**:
   хранится только в памяти процесса (последние 10 сообщений на `session_id`, включая
@@ -761,7 +876,14 @@ python scripts/run_telegram_bot.py
 - новый `LangChainToolCallingAgent` пока не интегрирован в Telegram-бот: Telegram на этом
   этапе продолжает использовать существующий `ConversationAnswerService`; интеграция агента —
   следующий stage;
-- vector memory пока не реализована;
+- долговременная память (`UserMemoryService`) реализована, но **ещё не интегрирована в
+  Telegram и в LangChain agent** (Stage 4I): бот пока не выполняет `Запомни: ...` команды и
+  не подмешивает memory в ответы; `/reset` очищает только короткую process-local память и
+  не будет удалять долговременную память и после интеграции;
+- ротация `USER_MEMORY_HASH_SECRET` делает ранее записанную память недостижимой через
+  новую identity (миграция identity не реализована);
+- дедупликация памяти — только детерминированная по нормализованному тексту; семантически
+  близкие, но текстуально разные statements сохраняются как отдельные записи;
 - Telegram bot — MVP без admin-доступа, без управления документами/индексацией через чат
   (URL indexing через Telegram не реализовано и не планируется в этом виде), без streaming
   ответов, без reranking, без claim-level верификации;

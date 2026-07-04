@@ -591,6 +591,115 @@ class LangChainAgentResult(BaseModel):
         return self
 
 
+UserMemoryWriteStatus = Literal["created", "duplicate"]
+
+
+class UserMemoryRecord(BaseModel):
+    """One long-term user memory statement, as stored in the user's Pinecone namespace."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    memory_id: str
+    text: str
+    content_hash: str
+    memory_kind: str
+    schema_version: int
+    created_at: str
+
+    @field_validator("memory_id", "text", "content_hash", "memory_kind", "created_at")
+    @classmethod
+    def _validate_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank.")
+        return value
+
+    @field_validator("schema_version")
+    @classmethod
+    def _validate_schema_version(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("schema_version must be greater than or equal to one.")
+        return value
+
+
+class UserMemoryWriteResult(BaseModel):
+    """Outcome of one explicit remember() call: created or deterministic duplicate."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: UserMemoryWriteStatus
+    memory_id: str
+    identity_digest: str
+
+    @field_validator("memory_id", "identity_digest")
+    @classmethod
+    def _validate_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank.")
+        return value
+
+
+class UserMemoryMatch(BaseModel):
+    """A single accepted recall match from the user's own memory namespace."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    memory_id: str
+    text: str
+    score: float
+    memory_kind: str
+
+    @field_validator("memory_id", "text", "memory_kind")
+    @classmethod
+    def _validate_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank.")
+        return value
+
+
+class UserMemoryRecallResult(BaseModel):
+    """The full outcome of one recall() call; safe and typed even when nothing matched."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    matches: tuple[UserMemoryMatch, ...]
+    found: bool
+    threshold: float
+    top_k: int
+    raw_candidate_count: int
+    identity_digest: str
+
+    @field_validator("top_k")
+    @classmethod
+    def _validate_top_k(cls, value: int) -> int:
+        if value < 1 or value > 50:
+            raise ValueError("top_k must be between 1 and 50 inclusive.")
+        return value
+
+    @field_validator("raw_candidate_count")
+    @classmethod
+    def _validate_raw_candidate_count(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("raw_candidate_count must be greater than or equal to zero.")
+        return value
+
+    @field_validator("identity_digest")
+    @classmethod
+    def _validate_identity_digest(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("identity_digest must not be blank.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_found_consistency(self) -> "UserMemoryRecallResult":
+        if self.found != bool(self.matches):
+            raise ValueError("found must be true exactly when matches is non-empty.")
+        if len(self.matches) > self.top_k:
+            raise ValueError("matches length must not exceed top_k.")
+        if len(self.matches) > self.raw_candidate_count:
+            raise ValueError("matches length must not exceed raw_candidate_count.")
+        return self
+
+
 class ConversationMessage(BaseModel):
     """A single short-term conversation-memory message (user or assistant turn)."""
 

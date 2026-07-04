@@ -4,6 +4,24 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+DocumentationToolStatus = Literal[
+    "success",
+    "no_context",
+    "retrieval_failure",
+    "generation_failure",
+]
+PyPIToolStatus = Literal[
+    "success",
+    "invalid_package_name",
+    "package_not_found",
+    "timeout",
+    "network_error",
+    "malformed_response",
+    "upstream_http_error",
+]
+AgentToolName = Literal["documentation_search", "pypi_lookup"]
+AgentExecutionOutcome = Literal["success", "safe_fallback"]
+
 
 class PineconeIndexStatus(BaseModel):
     """Snapshot of a Pinecone index's configuration and readiness."""
@@ -414,6 +432,162 @@ class GroundedAnswerResult(BaseModel):
             raise ValueError("sources must be empty when retrieved_chunk_count is zero.")
         if self.retrieved_chunk_count > 0 and not self.sources:
             raise ValueError("sources must not be empty when retrieved_chunk_count is positive.")
+        return self
+
+
+class DocumentationSearchToolInput(BaseModel):
+    """Structured input schema for the documentation LangChain tool."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    question: str
+
+    @field_validator("question")
+    @classmethod
+    def _validate_question_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("question must not be blank.")
+        return stripped
+
+
+class PyPILookupToolInput(BaseModel):
+    """Structured input schema for the PyPI LangChain tool."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    package_name: str
+
+    @field_validator("package_name")
+    @classmethod
+    def _validate_package_name_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("package_name must not be blank.")
+        return stripped
+
+
+class DocumentationToolResult(BaseModel):
+    """Safe serialized output for the documentation-search LangChain tool."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: DocumentationToolStatus
+    answer: str
+    sources: tuple[AnswerSource, ...]
+    context_found: bool
+
+    @field_validator("answer")
+    @classmethod
+    def _validate_answer_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("answer must not be blank.")
+        return stripped
+
+    @model_validator(mode="after")
+    def _validate_status_consistency(self) -> "DocumentationToolResult":
+        if self.status == "success":
+            if not self.context_found:
+                raise ValueError("context_found must be true when status is success.")
+            if not self.sources:
+                raise ValueError("sources must not be empty when status is success.")
+        else:
+            if self.context_found:
+                raise ValueError("context_found must be false for non-success statuses.")
+            if self.sources:
+                raise ValueError("sources must be empty for non-success statuses.")
+        return self
+
+
+class PyPIToolResult(BaseModel):
+    """Safe serialized output for the PyPI LangChain tool."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: PyPIToolStatus
+    package_name: str | None = None
+    latest_version: str | None = None
+    summary: str | None = None
+    requires_python: str | None = None
+    pypi_url: str | None = None
+    project_url: str | None = None
+
+    @field_validator(
+        "package_name",
+        "latest_version",
+        "summary",
+        "requires_python",
+        "pypi_url",
+        "project_url",
+    )
+    @classmethod
+    def _normalize_optional_string(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def _validate_status_consistency(self) -> "PyPIToolResult":
+        if self.status == "success":
+            for field_name in ("package_name", "latest_version", "pypi_url"):
+                if getattr(self, field_name) is None:
+                    raise ValueError(f"{field_name} is required when status is success.")
+        return self
+
+
+class LangChainAgentResult(BaseModel):
+    """Typed result returned by the LangChain tool-calling agent layer."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    question: str
+    answer: str
+    sources: tuple[AnswerSource, ...]
+    tools_used: tuple[AgentToolName, ...]
+    tool_call_count: int
+    used_no_tool: bool
+    outcome: AgentExecutionOutcome
+    failure_category: str | None = None
+
+    @field_validator("question", "answer")
+    @classmethod
+    def _validate_required_text(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank.")
+        return stripped
+
+    @field_validator("tool_call_count")
+    @classmethod
+    def _validate_tool_call_count(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("tool_call_count must be greater than or equal to zero.")
+        return value
+
+    @field_validator("failure_category")
+    @classmethod
+    def _normalize_failure_category(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def _validate_consistency(self) -> "LangChainAgentResult":
+        if self.used_no_tool:
+            if self.tools_used:
+                raise ValueError("tools_used must be empty when used_no_tool is true.")
+            if self.tool_call_count != 0:
+                raise ValueError("tool_call_count must be zero when used_no_tool is true.")
+        elif self.tool_call_count == 0:
+            raise ValueError("tool_call_count must be positive when a tool was used.")
+
+        if self.outcome == "success" and self.failure_category is not None:
+            raise ValueError("failure_category must be null when outcome is success.")
+        if self.outcome == "safe_fallback" and self.failure_category is None:
+            raise ValueError("failure_category is required when outcome is safe_fallback.")
         return self
 
 

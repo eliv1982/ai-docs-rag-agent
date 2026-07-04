@@ -1,12 +1,20 @@
-"""Thin tool-facing adapters over external read-only API integrations.
+"""Thin tool-facing adapters over the project's read-only service layer."""
 
-LangChain agent routing is not implemented yet; this module currently provides only
-small typed adapter functions that can be wrapped later.
-"""
-
+from ai_docs_agent.agent import DocumentationAnswerService
 from ai_docs_agent.config import AppSettings, get_settings
-from ai_docs_agent.models import PyPIPackageInfo
+from ai_docs_agent.models import GroundedAnswerResult, PyPIPackageInfo
 from ai_docs_agent.pypi import PyPILookupService
+
+
+def answer_documentation_question(
+    question: str,
+    *,
+    service: DocumentationAnswerService | None = None,
+    settings: AppSettings | None = None,
+) -> GroundedAnswerResult:
+    """Answer one documentation question through the existing grounded RAG path."""
+    resolved_service = service or DocumentationAnswerService(settings or get_settings())
+    return resolved_service.answer(question)
 
 
 def lookup_pypi_package(

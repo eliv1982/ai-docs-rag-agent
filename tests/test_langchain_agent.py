@@ -107,9 +107,13 @@ class FakeDocumentationService:
         self._result = result
         self._error = error
         self.calls: list[str] = []
+        self.history_calls: list[tuple[Any, ...]] = []
 
-    def answer(self, question: str) -> GroundedAnswerResult:
+    def answer(
+        self, question: str, *, history: tuple[Any, ...] = ()
+    ) -> GroundedAnswerResult:
         self.calls.append(question)
+        self.history_calls.append(tuple(history))
         if self._error is not None:
             raise self._error
         assert self._result is not None

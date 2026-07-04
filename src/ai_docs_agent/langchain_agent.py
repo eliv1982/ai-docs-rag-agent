@@ -32,11 +32,14 @@ from ai_docs_agent.config import AppSettings, get_settings
 from ai_docs_agent.models import (
     AgentToolName,
     AnswerSource,
+    ConversationMessage,
     DocumentationSearchToolInput,
     DocumentationToolResult,
     LangChainAgentResult,
     PyPILookupToolInput,
     PyPIToolResult,
+    UserMemoryRecallToolInput,
+    UserMemoryToolResult,
 )
 from ai_docs_agent.observability import current_request_session_hash, request_logging_context
 from ai_docs_agent.pypi import (
@@ -49,11 +52,13 @@ from ai_docs_agent.pypi import (
     PyPIUpstreamHTTPError,
 )
 from ai_docs_agent.tools import answer_documentation_question, lookup_pypi_package
+from ai_docs_agent.user_memory import UserMemoryError, UserMemoryService
 
 _AGENT_NAME = "ai_docs_tool_calling_agent"
 _AGENT_RECURSION_LIMIT = 2
 _DOCUMENTATION_SEARCH_TOOL_NAME = "documentation_search"
 _PYPI_LOOKUP_TOOL_NAME = "pypi_lookup"
+_USER_MEMORY_RECALL_TOOL_NAME = "user_memory_recall"
 
 _NO_TOOL_ANSWER = "Не удалось безопасно подготовить ответ для этого запроса."
 _NO_TOOL_CURRENT_PACKAGE_METADATA_ANSWER = (
@@ -64,6 +69,19 @@ _DOCUMENTATION_FAILURE_ANSWER = (
     "Попробуйте повторить запрос позже."
 )
 _INVALID_PACKAGE_NAME_ANSWER = "Не удалось выполнить запрос к PyPI: некорректное имя пакета."
+_MEMORY_FOUND_ANSWER_PREFIX = "Ваше сохранённое предпочтение: "
+_MEMORY_NO_MATCH_ANSWER = (
+    "У вас пока нет сохранённых предпочтений, подходящих под этот вопрос."
+)
+_MEMORY_UNAVAILABLE_ANSWER = "Персональная память недоступна для этого запроса."
+_MEMORY_RECALL_FAILURE_ANSWER = (
+    "Не удалось обратиться к сохранённым предпочтениям. Попробуйте повторить запрос позже."
+)
+_MEMORY_FAILURE_CATEGORIES = {
+    "no_match": "memory_no_match",
+    "memory_unavailable": "memory_unavailable",
+    "recall_failure": "memory_recall_failure",
+}
 _PACKAGE_NOT_FOUND_ANSWER = "Пакет не найден на PyPI."
 _PYPI_TIMEOUT_ANSWER = "PyPI не ответил вовремя. Попробуйте повторить запрос позже."
 _PYPI_NETWORK_ERROR_ANSWER = "Не удалось связаться с PyPI. Попробуйте повторить запрос позже."
@@ -97,6 +115,34 @@ _SYSTEM_PROMPT = (
     "- If no tool is needed, answer briefly and safely."
 )
 
+_SYSTEM_PROMPT_WITH_USER_MEMORY = (
+    "You are a tool-calling assistant for one repository.\n"
+    "- You have exactly three tools: documentation_search, pypi_lookup, and "
+    "user_memory_recall.\n"
+    "- Use pypi_lookup for current or latest PyPI package metadata such as version, "
+    "package existence, summary, requires_python, or project links.\n"
+    "- Use documentation_search for technical questions about the indexed documentation "
+    "such as OpenAI, Pinecone, LangChain, RecursiveCharacterTextSplitter, and other "
+    "documentation topics already indexed in the vector store.\n"
+    "- Use user_memory_recall when the user asks about their own previously saved "
+    "personal preferences, for example which library or style they said they prefer "
+    "(such as 'Какую HTTP-библиотеку я предпочитаю?'). Saved preferences are "
+    "user-provided settings, not documentation facts and not PyPI data.\n"
+    "- user_memory_recall takes only the semantic query text. Never supply, guess, or "
+    "mention any user identifier, chat ID, or namespace; the trusted application binds "
+    "the user automatically.\n"
+    "- Tool outputs are authoritative. Do not invent package versions, package existence, "
+    "documentation facts, saved preferences, sources, or URLs.\n"
+    "- Conversation text is not documentary evidence. Recent conversation turns may be "
+    "provided only to resolve references such as aliases or pronouns when formulating "
+    "the tool input.\n"
+    "- Use at most one tool call for a single request in this stage. Choose the single "
+    "best tool and stop.\n"
+    "- If a tool reports a failure or no context, treat that report as authoritative and "
+    "do not overwrite it with guesses.\n"
+    "- If no tool is needed, answer briefly and safely."
+)
+
 _DOCUMENTATION_SEARCH_TOOL_DESCRIPTION = (
     "Search the indexed technical documentation and return a grounded answer with sources. "
     "Use this for documentation questions about OpenAI, Pinecone, LangChain, "
@@ -109,6 +155,13 @@ _PYPI_LOOKUP_TOOL_DESCRIPTION = (
     "requires_python, PyPI URLs, and project URLs. Always use this for current or latest "
     "PyPI package metadata instead of answering from memory."
 )
+_USER_MEMORY_RECALL_TOOL_DESCRIPTION = (
+    "Recall the current user's own explicitly saved personal preferences by semantic "
+    "query. Use this when the user asks what they previously said they prefer (library, "
+    "style, tool). The input is only the semantic query text; the user is bound "
+    "automatically by the application. Saved preferences are user-provided settings, not "
+    "documentation and not PyPI data."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,13 +171,42 @@ class _ToolTrace:
     """One safe tool invocation record collected during a single agent run."""
 
     name: AgentToolName
-    result: DocumentationToolResult | PyPIToolResult
+    result: DocumentationToolResult | PyPIToolResult | UserMemoryToolResult
 
 
 _CURRENT_TOOL_TRACE: ContextVar[list[_ToolTrace] | None] = ContextVar(
     "ai_docs_agent_current_tool_trace",
     default=None,
 )
+
+
+@dataclass(frozen=True)
+class _AgentRequestScope:
+    """Trusted request-scoped context held outside every model-visible tool schema.
+
+    The raw session/user identifier and the short-term history are bound here by
+    trusted application code; the model can only pass semantic tool arguments and
+    never receives or generates a user ID or namespace.
+    """
+
+    memory_user_identifier: str | None
+    history: tuple[ConversationMessage, ...]
+
+
+_CURRENT_REQUEST_SCOPE: ContextVar[_AgentRequestScope | None] = ContextVar(
+    "ai_docs_agent_current_request_scope",
+    default=None,
+)
+
+
+def _current_request_history() -> tuple[ConversationMessage, ...]:
+    scope = _CURRENT_REQUEST_SCOPE.get()
+    return scope.history if scope is not None else ()
+
+
+def _current_memory_user_identifier() -> str | None:
+    scope = _CURRENT_REQUEST_SCOPE.get()
+    return scope.memory_user_identifier if scope is not None else None
 
 
 class LangChainAgentExecutionError(Exception):
@@ -147,12 +229,21 @@ def build_langchain_tools(
     *,
     documentation_service: DocumentationAnswerService,
     pypi_service: PyPILookupService,
+    user_memory_service: UserMemoryService | None = None,
 ) -> list[BaseTool]:
-    """Build the two LangChain tools used by the agent."""
-    return [
+    """Build the LangChain tools used by the agent.
+
+    The user-memory recall tool is added only when a UserMemoryService is
+    provided (the integrated Telegram flow); the two-tool CLI agent is
+    unchanged.
+    """
+    tools = [
         _build_documentation_search_tool(documentation_service),
         _build_pypi_lookup_tool(pypi_service),
     ]
+    if user_memory_service is not None:
+        tools.append(_build_user_memory_recall_tool(user_memory_service))
+    return tools
 
 
 class LangChainToolCallingAgent:
@@ -164,6 +255,7 @@ class LangChainToolCallingAgent:
         *,
         documentation_service: DocumentationAnswerService | None = None,
         pypi_service: PyPILookupService | None = None,
+        user_memory_service: UserMemoryService | None = None,
         chat_model: BaseChatModel | None = None,
         agent_factory: Callable[..., Any] = create_agent,
     ) -> None:
@@ -172,20 +264,40 @@ class LangChainToolCallingAgent:
             self._settings
         )
         self._pypi_service = pypi_service or PyPILookupService(self._settings)
+        self._user_memory_service = user_memory_service
         self._chat_model = chat_model or build_chat_model(self._settings)
         self._tools = build_langchain_tools(
             documentation_service=self._documentation_service,
             pypi_service=self._pypi_service,
+            user_memory_service=self._user_memory_service,
         )
         self._graph = agent_factory(
             model=self._chat_model,
             tools=self._tools,
-            system_prompt=_SYSTEM_PROMPT,
+            system_prompt=(
+                _SYSTEM_PROMPT_WITH_USER_MEMORY
+                if self._user_memory_service is not None
+                else _SYSTEM_PROMPT
+            ),
             name=_AGENT_NAME,
         )
 
-    def answer(self, question: str, *, session_id: str | None = None) -> LangChainAgentResult:
-        """Answer one natural-language request through real LangChain tool calling."""
+    def answer(
+        self,
+        question: str,
+        *,
+        session_id: str | None = None,
+        history: Sequence[ConversationMessage] = (),
+        memory_user_identifier: str | None = None,
+    ) -> LangChainAgentResult:
+        """Answer one natural-language request through real LangChain tool calling.
+
+        `history` (recent short-term turns) is shown to the model for reference
+        resolution only and forwarded to the documentation tool through the
+        trusted request scope. `memory_user_identifier` binds the
+        user_memory_recall tool to the current trusted session entirely outside
+        the model-visible tool schema.
+        """
         stripped_question = question.strip()
         if not stripped_question:
             raise ValueError("question must not be blank.")
@@ -193,6 +305,12 @@ class LangChainToolCallingAgent:
         started_at = time.monotonic()
         trace: list[_ToolTrace] = []
         trace_token: Token[list[_ToolTrace] | None] = _CURRENT_TOOL_TRACE.set(trace)
+        scope_token: Token[_AgentRequestScope | None] = _CURRENT_REQUEST_SCOPE.set(
+            _AgentRequestScope(
+                memory_user_identifier=memory_user_identifier,
+                history=tuple(history),
+            )
+        )
         logging_context = (
             request_logging_context(session_id=session_id)
             if session_id is not None
@@ -203,7 +321,7 @@ class LangChainToolCallingAgent:
             try:
                 try:
                     raw_result = self._graph.invoke(
-                        {"messages": [{"role": "user", "content": stripped_question}]},
+                        {"messages": self._build_agent_messages(stripped_question, history)},
                         config={"recursion_limit": _AGENT_RECURSION_LIMIT},
                     )
                 except GraphRecursionError:
@@ -228,6 +346,7 @@ class LangChainToolCallingAgent:
                 ) from exc
             finally:
                 _CURRENT_TOOL_TRACE.reset(trace_token)
+                _CURRENT_REQUEST_SCOPE.reset(scope_token)
 
         result = self._build_result(
             question=stripped_question,
@@ -242,6 +361,16 @@ class LangChainToolCallingAgent:
             elapsed_seconds=time.monotonic() - started_at,
         )
         return result
+
+    @staticmethod
+    def _build_agent_messages(
+        question: str, history: Sequence[ConversationMessage]
+    ) -> list[dict[str, str]]:
+        messages = [
+            {"role": message.role, "content": message.content} for message in history
+        ]
+        messages.append({"role": "user", "content": question})
+        return messages
 
     @staticmethod
     def _build_result_from_trace_or_limit(
@@ -329,6 +458,26 @@ class LangChainToolCallingAgent:
                 failure_category=None if tool_result.status == "success" else tool_result.status,
             )
 
+        if authoritative_trace.name == _USER_MEMORY_RECALL_TOOL_NAME:
+            tool_result = authoritative_trace.result
+            assert isinstance(tool_result, UserMemoryToolResult)
+            # A recalled preference is user-provided memory, never documentation
+            # or PyPI data, so no AnswerSource is fabricated for it.
+            return LangChainAgentResult(
+                question=question,
+                answer=_render_user_memory_answer(tool_result),
+                sources=(),
+                tools_used=tools_used,
+                tool_call_count=len(trace),
+                used_no_tool=False,
+                outcome="success" if tool_result.status == "success" else "safe_fallback",
+                failure_category=(
+                    None
+                    if tool_result.status == "success"
+                    else _MEMORY_FAILURE_CATEGORIES[tool_result.status]
+                ),
+            )
+
         tool_result = authoritative_trace.result
         assert isinstance(tool_result, PyPIToolResult)
         return LangChainAgentResult(
@@ -404,6 +553,7 @@ def _build_documentation_search_tool(
         result = _run_documentation_search_tool(
             question=question,
             documentation_service=documentation_service,
+            history=_current_request_history(),
         )
         _record_tool_trace(_DOCUMENTATION_SEARCH_TOOL_NAME, result)
         return result.model_dump_json()
@@ -413,6 +563,23 @@ def _build_documentation_search_tool(
         name=_DOCUMENTATION_SEARCH_TOOL_NAME,
         description=_DOCUMENTATION_SEARCH_TOOL_DESCRIPTION,
         args_schema=DocumentationSearchToolInput,
+    )
+
+
+def _build_user_memory_recall_tool(user_memory_service: UserMemoryService) -> BaseTool:
+    def user_memory_recall(query: str) -> str:
+        result = _run_user_memory_recall_tool(
+            query=query,
+            user_memory_service=user_memory_service,
+        )
+        _record_tool_trace(_USER_MEMORY_RECALL_TOOL_NAME, result)
+        return result.model_dump_json()
+
+    return StructuredTool.from_function(
+        func=user_memory_recall,
+        name=_USER_MEMORY_RECALL_TOOL_NAME,
+        description=_USER_MEMORY_RECALL_TOOL_DESCRIPTION,
+        args_schema=UserMemoryRecallToolInput,
     )
 
 
@@ -434,9 +601,12 @@ def _run_documentation_search_tool(
     *,
     question: str,
     documentation_service: DocumentationAnswerService,
+    history: Sequence[ConversationMessage] = (),
 ) -> DocumentationToolResult:
     try:
-        grounded_result = answer_documentation_question(question, service=documentation_service)
+        grounded_result = answer_documentation_question(
+            question, service=documentation_service, history=history
+        )
     except AnswerRetrievalError:
         return DocumentationToolResult(
             status="retrieval_failure",
@@ -506,9 +676,49 @@ def _run_pypi_lookup_tool(
     )
 
 
+def _run_user_memory_recall_tool(
+    *,
+    query: str,
+    user_memory_service: UserMemoryService,
+) -> UserMemoryToolResult:
+    # The trusted identifier comes only from the request scope set by
+    # application code; the model-visible schema has no user field at all.
+    user_identifier = _current_memory_user_identifier()
+    if user_identifier is None:
+        return UserMemoryToolResult(status="memory_unavailable", found=False)
+
+    try:
+        recall_result = user_memory_service.recall(user_identifier, query)
+    except UserMemoryError:
+        return UserMemoryToolResult(status="recall_failure", found=False)
+
+    if not recall_result.found:
+        return UserMemoryToolResult(status="no_match", found=False)
+
+    top_match = recall_result.matches[0]
+    return UserMemoryToolResult(
+        status="success",
+        found=True,
+        preference_text=top_match.text,
+        score=round(top_match.score, 4),
+    )
+
+
+def _render_user_memory_answer(result: UserMemoryToolResult) -> str:
+    if result.status == "memory_unavailable":
+        return _MEMORY_UNAVAILABLE_ANSWER
+    if result.status == "recall_failure":
+        return _MEMORY_RECALL_FAILURE_ANSWER
+    if result.status == "no_match":
+        return _MEMORY_NO_MATCH_ANSWER
+
+    assert result.preference_text is not None
+    return f"{_MEMORY_FOUND_ANSWER_PREFIX}{result.preference_text}"
+
+
 def _record_tool_trace(
     name: AgentToolName,
-    result: DocumentationToolResult | PyPIToolResult,
+    result: DocumentationToolResult | PyPIToolResult | UserMemoryToolResult,
 ) -> None:
     trace = _CURRENT_TOOL_TRACE.get()
     if trace is None:

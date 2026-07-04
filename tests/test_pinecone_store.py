@@ -26,6 +26,7 @@ _REQUIRED: dict[str, Any] = {
     "openai_api_key": "sk-test-openai",
     "pinecone_api_key": "pc-test-key",
     "openai_chat_model": "gpt-4o-mini",
+    "telegram_bot_token": "test-telegram-token",
 }
 
 

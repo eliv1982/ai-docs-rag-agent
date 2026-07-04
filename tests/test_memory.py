@@ -8,12 +8,20 @@ from typing import Any
 
 import pytest
 
+from ai_docs_agent.agent import DocumentationAnswerService
+from ai_docs_agent.config import AppSettings
 from ai_docs_agent.memory import (
     ConversationAnswerService,
     ConversationMemoryError,
     InMemoryConversationMemory,
 )
-from ai_docs_agent.models import AnswerSource, ConversationMessage, GroundedAnswerResult
+from ai_docs_agent.models import (
+    AnswerSource,
+    ConversationMessage,
+    GroundedAnswerResult,
+    RetrievalResult,
+    RetrievedChunk,
+)
 
 
 def make_message(role: str = "user", content: str = "hello") -> ConversationMessage:
@@ -40,6 +48,43 @@ def make_result(**overrides: Any) -> GroundedAnswerResult:
         "retrieved_chunk_count": 1,
     }
     return GroundedAnswerResult(**{**defaults, **overrides})
+
+
+def make_settings(**overrides: Any) -> AppSettings:
+    required: dict[str, Any] = {
+        "openai_api_key": "sk-test-openai",
+        "pinecone_api_key": "pc-test-key",
+        "openai_chat_model": "gpt-4o-mini",
+        "telegram_bot_token": "test-telegram-token",
+    }
+    return AppSettings(_env_file=None, **{**required, **overrides})
+
+
+def make_chunk(**overrides: Any) -> RetrievedChunk:
+    defaults: dict[str, Any] = {
+        "chunk_id": "doc-abc123-chunk-0000",
+        "score": 0.9,
+        "document_id": "doc-abc123",
+        "source_url": "https://docs.example.com/page",
+        "final_url": "https://docs.example.com/page",
+        "title": "Example Page",
+        "content_hash": "hash-value",
+        "chunk_index": 0,
+        "chunk_count": 1,
+        "text": "RecursiveCharacterTextSplitter recursively splits text.",
+    }
+    return RetrievedChunk(**{**defaults, **overrides})
+
+
+def make_retrieval_result(**overrides: Any) -> RetrievalResult:
+    matches = overrides.pop("matches", ())
+    defaults: dict[str, Any] = {
+        "query": "query",
+        "namespace": "documentation",
+        "top_k": 5,
+        "matches": matches,
+    }
+    return RetrievalResult(**{**defaults, **overrides})
 
 
 # --- InMemoryConversationMemory ----------------------------------------------------
@@ -228,6 +273,32 @@ class FakeAnswerService:
         return self._result
 
 
+class FakeRetrievalService:
+    def __init__(self, *, results: list[RetrievalResult]) -> None:
+        self._results = list(results)
+        self.calls: list[tuple[str, int | None, str | None]] = []
+
+    def search(
+        self, query: str, *, top_k: int | None = None, namespace: str | None = None
+    ) -> RetrievalResult:
+        self.calls.append((query, top_k, namespace))
+        assert self._results, "FakeRetrievalService.search called more times than expected."
+        return self._results.pop(0)
+
+
+class FakeChatClient:
+    def __init__(self, *, answers: list[str]) -> None:
+        self._answers = list(answers)
+        self.calls: list[dict[str, str]] = []
+
+    def complete(self, *, model: str, system_prompt: str, user_prompt: str) -> str:
+        self.calls.append(
+            {"model": model, "system_prompt": system_prompt, "user_prompt": user_prompt}
+        )
+        assert self._answers, "FakeChatClient.complete called more times than expected."
+        return self._answers.pop(0)
+
+
 def test_first_answer_receives_empty_history() -> None:
     fake_answer_service = FakeAnswerService(result=make_result())
     service = ConversationAnswerService(fake_answer_service)
@@ -294,6 +365,95 @@ def test_no_context_fallback_result_is_stored() -> None:
     assert "не найдено" in history[1].content
 
 
+def test_alias_exchange_is_available_to_the_next_turn() -> None:
+    alias_question = "В этом диалоге будем называть RecursiveCharacterTextSplitter «Резак»."
+    alias_ack = (
+        "Хорошо, в рамках текущего диалога буду называть "
+        "RecursiveCharacterTextSplitter «Резак»."
+    )
+    fake_answer_service = FakeAnswerService(
+        result=make_result(question=alias_question, answer=alias_ack)
+    )
+    memory = InMemoryConversationMemory()
+    service = ConversationAnswerService(fake_answer_service, memory=memory)
+
+    service.answer("session-a", alias_question)
+    fake_answer_service._result = make_result(
+        question="Что делает Резак?", answer="Резак делит текст рекурсивно."
+    )
+    service.answer("session-a", "Что делает Резак?")
+
+    second_call_history = fake_answer_service.calls[1]["history"]
+    assert any("Резак" in message.content for message in second_call_history)
+
+
+def test_alias_exchange_is_stored_only_in_the_correct_session() -> None:
+    alias_question = "В этом диалоге называй RecursiveCharacterTextSplitter Резаком."
+    alias_ack = "Хорошо, в рамках текущего диалога буду называть его Резаком."
+    fake_answer_service = FakeAnswerService(
+        result=make_result(question=alias_question, answer=alias_ack)
+    )
+    memory = InMemoryConversationMemory()
+    service = ConversationAnswerService(fake_answer_service, memory=memory)
+
+    service.answer("session-a", alias_question)
+
+    assert [message.content for message in memory.get_history("session-a")] == [
+        alias_question,
+        alias_ack,
+    ]
+    assert memory.get_history("session-b") == ()
+
+
+def test_reset_removes_the_alias_history() -> None:
+    alias_question = "В этом диалоге будем называть RecursiveCharacterTextSplitter «Резак»."
+    alias_ack = "Хорошо, буду называть его «Резак»."
+    fake_answer_service = FakeAnswerService(
+        result=make_result(question=alias_question, answer=alias_ack)
+    )
+    memory = InMemoryConversationMemory()
+    service = ConversationAnswerService(fake_answer_service, memory=memory)
+    service.answer("session-a", alias_question)
+
+    service.reset("session-a")
+
+    assert memory.get_history("session-a") == ()
+
+
+def test_reset_clears_alias_context_so_follow_up_returns_normal_no_context_fallback() -> None:
+    alias_question = "В этом диалоге называй RecursiveCharacterTextSplitter Резаком."
+    settings = make_settings()
+    retrieval = FakeRetrievalService(
+        results=[
+            make_retrieval_result(query=alias_question, matches=(make_chunk(score=0.6),)),
+            make_retrieval_result(query="Для чего нужен Резак?", matches=()),
+        ]
+    )
+    chat = FakeChatClient(
+        answers=[
+            "Хорошо, в рамках текущего диалога буду называть его Резаком.",
+            "Рекурсивный сплиттер разбивает текст.",
+        ]
+    )
+    answer_service = DocumentationAnswerService(
+        settings, retrieval_service=retrieval, chat_client=chat
+    )
+    memory = InMemoryConversationMemory()
+    service = ConversationAnswerService(answer_service, memory=memory)
+
+    service.answer("session-a", alias_question)
+    service.reset("session-a")
+    result = service.answer("session-a", "Для чего нужен Резак?")
+
+    assert result.retrieved_chunk_count == 0
+    assert result.sources == ()
+    assert "не найдено" in result.answer
+    assert retrieval.calls == [
+        (alias_question, None, None),
+        ("Для чего нужен Резак?", None, None),
+    ]
+
+
 def test_reset_removes_only_the_chosen_session() -> None:
     fake_answer_service = FakeAnswerService(result=make_result())
     memory = InMemoryConversationMemory()
@@ -305,6 +465,49 @@ def test_reset_removes_only_the_chosen_session() -> None:
 
     assert memory.get_history("session-a") == ()
     assert len(memory.get_history("session-b")) == 2
+
+
+def test_alias_context_does_not_leak_between_sessions() -> None:
+    alias_question = "В этом диалоге называй RecursiveCharacterTextSplitter Резаком."
+    settings = make_settings()
+    splitter_chunk = make_chunk(
+        score=0.62,
+        title="Recursive Splitter Docs",
+        final_url="https://docs.example.com/recursive-splitter",
+        source_url="https://docs.example.com/recursive-splitter",
+        document_id="doc-splitter",
+    )
+    retrieval = FakeRetrievalService(
+        results=[
+            make_retrieval_result(query=alias_question, matches=(make_chunk(score=0.6),)),
+            make_retrieval_result(query="Для чего нужен Резак?", matches=()),
+            make_retrieval_result(
+                query="Для чего нужен RecursiveCharacterTextSplitter?",
+                matches=(splitter_chunk,),
+            ),
+            make_retrieval_result(query="Для чего нужен Резак?", matches=()),
+        ]
+    )
+    chat = FakeChatClient(
+        answers=[
+            "Хорошо, в рамках текущего диалога буду называть его Резаком.",
+            "Для чего нужен RecursiveCharacterTextSplitter?",
+            "Он нужен, чтобы рекурсивно разбивать текст.",
+        ]
+    )
+    answer_service = DocumentationAnswerService(
+        settings, retrieval_service=retrieval, chat_client=chat
+    )
+    memory = InMemoryConversationMemory()
+    service = ConversationAnswerService(answer_service, memory=memory)
+
+    service.answer("session-a", alias_question)
+    session_a_result = service.answer("session-a", "Для чего нужен Резак?")
+    session_b_result = service.answer("session-b", "Для чего нужен Резак?")
+
+    assert session_a_result.retrieved_chunk_count == 1
+    assert session_b_result.retrieved_chunk_count == 0
+    assert "не найдено" in session_b_result.answer
 
 
 def test_top_k_and_namespace_are_forwarded_unchanged() -> None:

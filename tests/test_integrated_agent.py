@@ -340,6 +340,43 @@ def test_agent_binds_all_three_tools() -> None:
     ]
 
 
+def test_parallel_tool_calls_never_execute_tools_in_the_integrated_flow() -> None:
+    """One-tool-call contract: a multi-call model step runs nothing, deterministically."""
+
+    def parallel_script(messages: list[BaseMessage]) -> AIMessage:
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "documentation_search",
+                    "args": {"question": _DOCS_QUESTION},
+                    "id": "call_1",
+                    "type": "tool_call",
+                },
+                {
+                    "name": "user_memory_recall",
+                    "args": {"query": "предпочтения"},
+                    "id": "call_2",
+                    "type": "tool_call",
+                },
+            ],
+        )
+
+    service, model, docs, pypi, memory = make_integrated_service(script=parallel_script)
+
+    result = service.handle_message(_SESSION, _DOCS_QUESTION)
+
+    assert docs.calls == []
+    assert pypi.calls == []
+    assert memory.recall_calls == []
+    assert memory.remember_calls == []
+    assert result.outcome == "safe_fallback"
+    assert result.failure_category == "multiple_tool_calls"
+    assert result.tool_call_count == 0
+    assert result.sources == ()
+    assert len(model.model_calls) == 1  # the graph stopped after the rejected step
+
+
 def test_memory_recall_tool_schema_contains_only_the_semantic_query() -> None:
     tools = build_langchain_tools(
         documentation_service=FakeDocumentationService(),  # type: ignore[arg-type]

@@ -15,10 +15,10 @@ import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import Field, ValidationError
+from pydantic import Field
 from telegram.ext import CommandHandler, MessageHandler
 
-from ai_docs_agent.config import AppSettings
+from ai_docs_agent.config import AppSettings, ConfigurationError
 from ai_docs_agent.integrated_agent import (
     IntegratedAgentError,
     IntegratedConversationAgentService,
@@ -1023,7 +1023,7 @@ def test_build_application_fails_concisely_on_missing_configuration(
     get_settings.cache_clear()
 
     try:
-        with pytest.raises(ValidationError) as exc_info:
+        with pytest.raises(ConfigurationError) as exc_info:
             build_application()
     finally:
         get_settings.cache_clear()

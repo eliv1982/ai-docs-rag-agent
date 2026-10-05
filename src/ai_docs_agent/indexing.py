@@ -11,7 +11,7 @@ shrinks the chunk layout for unchanged content).
 import time
 from collections.abc import Callable
 
-from ai_docs_agent.config import AppSettings
+from ai_docs_agent.config import IndexingSettings
 from ai_docs_agent.models import DocumentIndexingResult, UrlProcessingResult
 from ai_docs_agent.pinecone_store import PineconeStore, PineconeStoreError
 from ai_docs_agent.url_ingestion import UrlIngestionService
@@ -42,7 +42,7 @@ class DocumentIndexingService:
 
     def __init__(
         self,
-        settings: AppSettings,
+        settings: IndexingSettings,
         *,
         url_ingestion_service: UrlIngestionService | None = None,
         pinecone_store: PineconeStore | None = None,

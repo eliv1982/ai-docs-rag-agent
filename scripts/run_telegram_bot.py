@@ -15,7 +15,7 @@ from typing import Any
 from pydantic import ValidationError
 from telegram.error import TelegramError
 
-from ai_docs_agent.config import get_settings
+from ai_docs_agent.config import ConfigurationError, get_settings
 from ai_docs_agent.observability import log_exception_safely
 from ai_docs_agent.telegram_bot import (
     _STARTUP_SUMMARY_BOT_DATA_KEY,
@@ -60,9 +60,16 @@ def main(*, application_factory: Callable[[], Any] | None = None) -> int:
 
     try:
         application = factory()
-    except ValidationError as exc:
+    except (ConfigurationError, ValidationError) as exc:
+        # A raw ValidationError embeds the offending input values; only ever
+        # print the redacted form (variable names and reasons).
+        error = (
+            exc
+            if isinstance(exc, ConfigurationError)
+            else ConfigurationError.from_validation_error(exc)
+        )
         logger.error("Telegram bot failed to start due to invalid configuration.")
-        print(f"Telegram bot FAILED to start: {exc}")
+        print(f"Telegram bot FAILED to start: {error}")
         return 1
     except Exception as exc:
         log_exception_safely(

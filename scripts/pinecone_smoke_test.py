@@ -9,7 +9,7 @@ Exit codes: 0 = full success (including cleanup); 1 = execution/domain error;
 
 import sys
 
-from ai_docs_agent.config import get_settings
+from ai_docs_agent.config import ConfigurationError, VectorStoreSettings, load_settings
 from ai_docs_agent.models import PineconeSmokeTestResult
 from ai_docs_agent.pinecone_store import PineconeSmokeTestError, PineconeStore, PineconeStoreError
 
@@ -39,7 +39,11 @@ def format_smoke_test_report(result: PineconeSmokeTestResult) -> tuple[list[str]
 
 
 def main() -> int:
-    settings = get_settings()
+    try:
+        settings = load_settings(VectorStoreSettings)
+    except ConfigurationError as exc:
+        print(f"Pinecone smoke test FAILED: {exc}")
+        return 1
     store = PineconeStore(settings)
 
     try:

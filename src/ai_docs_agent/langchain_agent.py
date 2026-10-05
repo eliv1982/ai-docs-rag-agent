@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import ModelRequest, ModelResponse, wrap_model_call
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import BaseTool, StructuredTool
@@ -28,7 +29,7 @@ from ai_docs_agent.agent import (
     AnswerServiceError,
     DocumentationAnswerService,
 )
-from ai_docs_agent.config import AppSettings, get_settings
+from ai_docs_agent.config import AgentSettings, AnswerSettings, load_settings
 from ai_docs_agent.models import (
     AgentToolName,
     AnswerSource,
@@ -64,6 +65,13 @@ _NO_TOOL_ANSWER = "Не удалось безопасно подготовить
 _NO_TOOL_CURRENT_PACKAGE_METADATA_ANSWER = (
     "Не удалось подтвердить актуальные данные пакета без обращения к PyPI."
 )
+_MULTIPLE_TOOL_CALLS_ANSWER = (
+    "Не удалось безопасно обработать запрос: допускается не более одного вызова "
+    "инструмента на запрос. Попробуйте переформулировать вопрос."
+)
+_MULTIPLE_TOOL_CALLS_FAILURE_CATEGORY = "multiple_tool_calls"
+# response_metadata flag on the AIMessage that replaces a rejected multi-call model step.
+_REJECTED_MULTI_TOOL_CALL_KEY = "ai_docs_agent_rejected_multi_tool_call"
 _DOCUMENTATION_FAILURE_ANSWER = (
     "Не удалось получить подтвержденный ответ из базы документации. "
     "Попробуйте повторить запрос позже."
@@ -213,16 +221,61 @@ class LangChainAgentExecutionError(Exception):
     """Raised when the LangChain agent cannot complete a request safely."""
 
 
-def build_chat_model(settings: AppSettings) -> BaseChatModel:
+def build_chat_model(settings: AnswerSettings) -> BaseChatModel:
     """Build the real chat model used by the LangChain agent."""
     kwargs: dict[str, Any] = {
         "model": settings.openai_chat_model,
         "api_key": settings.openai_api_key.get_secret_value(),
         "temperature": 0,
+        "timeout": settings.openai_timeout_seconds,
     }
     if settings.openai_base_url is not None:
         kwargs["base_url"] = settings.openai_base_url
     return ChatOpenAI(**kwargs)
+
+
+@wrap_model_call
+def _enforce_single_tool_call(
+    request: ModelRequest[Any],
+    handler: Callable[[ModelRequest[Any]], ModelResponse[Any]],
+) -> ModelResponse[Any]:
+    """Enforce the one-tool-call-per-request contract in code, not only in the prompt.
+
+    First the provider is asked not to emit parallel tool calls at all. If a
+    model step nevertheless contains several tool calls, that step is replaced
+    by a marker message with no tool calls, so the graph ends before the tools
+    node and none of the calls is executed. The outcome is therefore the same
+    deterministic fallback whatever order the calls arrived in.
+    """
+    response = handler(
+        request.override(
+            model_settings={**request.model_settings, "parallel_tool_calls": False}
+        )
+    )
+    if not isinstance(response, ModelResponse):
+        return response
+    return ModelResponse(
+        result=[_reject_parallel_tool_calls(message) for message in response.result],
+        structured_response=response.structured_response,
+    )
+
+
+def _reject_parallel_tool_calls(message: BaseMessage) -> BaseMessage:
+    if isinstance(message, AIMessage) and len(message.tool_calls) > 1:
+        return AIMessage(
+            content=_MULTIPLE_TOOL_CALLS_ANSWER,
+            id=message.id,
+            response_metadata={_REJECTED_MULTI_TOOL_CALL_KEY: True},
+        )
+    return message
+
+
+def _has_rejected_multi_tool_call(messages: Sequence[BaseMessage]) -> bool:
+    return any(
+        isinstance(message, AIMessage)
+        and message.response_metadata.get(_REJECTED_MULTI_TOOL_CALL_KEY) is True
+        for message in messages
+    )
 
 
 def build_langchain_tools(
@@ -251,7 +304,7 @@ class LangChainToolCallingAgent:
 
     def __init__(
         self,
-        settings: AppSettings | None = None,
+        settings: AgentSettings | None = None,
         *,
         documentation_service: DocumentationAnswerService | None = None,
         pypi_service: PyPILookupService | None = None,
@@ -259,7 +312,7 @@ class LangChainToolCallingAgent:
         chat_model: BaseChatModel | None = None,
         agent_factory: Callable[..., Any] = create_agent,
     ) -> None:
-        self._settings = settings or get_settings()
+        self._settings = settings or load_settings(AgentSettings)
         self._documentation_service = documentation_service or DocumentationAnswerService(
             self._settings
         )
@@ -280,6 +333,7 @@ class LangChainToolCallingAgent:
                 else _SYSTEM_PROMPT
             ),
             name=_AGENT_NAME,
+            middleware=[_enforce_single_tool_call],
         )
 
     def answer(
@@ -397,6 +451,9 @@ class LangChainToolCallingAgent:
         raw_messages: Sequence[BaseMessage],
         trace: Sequence[_ToolTrace],
     ) -> LangChainAgentResult:
+        if _has_rejected_multi_tool_call(raw_messages):
+            return LangChainToolCallingAgent._build_multiple_tool_calls_result(question, trace)
+
         if trace:
             return LangChainToolCallingAgent._build_result_from_trace(question, trace)
 
@@ -441,7 +498,12 @@ class LangChainToolCallingAgent:
         question: str,
         trace: Sequence[_ToolTrace],
     ) -> LangChainAgentResult:
-        authoritative_trace = trace[-1]
+        if len(trace) > 1:
+            # Defensive: the contract allows one tool call per request. Never let
+            # trace/completion order pick the answer if several calls ran anyway.
+            return LangChainToolCallingAgent._build_multiple_tool_calls_result(question, trace)
+
+        authoritative_trace = trace[0]
         tools_used = _ordered_unique_tool_names(trace)
 
         if authoritative_trace.name == _DOCUMENTATION_SEARCH_TOOL_NAME:
@@ -489,6 +551,26 @@ class LangChainToolCallingAgent:
             used_no_tool=False,
             outcome="success" if tool_result.status == "success" else "safe_fallback",
             failure_category=None if tool_result.status == "success" else tool_result.status,
+        )
+
+    @staticmethod
+    def _build_multiple_tool_calls_result(
+        question: str,
+        trace: Sequence[_ToolTrace],
+    ) -> LangChainAgentResult:
+        # Sorted (not trace order) so the result is identical however the calls
+        # were ordered or scheduled. An empty trace means the step was rejected
+        # before any tool executed.
+        tools_used = tuple(sorted({item.name for item in trace}))
+        return LangChainAgentResult(
+            question=question,
+            answer=_MULTIPLE_TOOL_CALLS_ANSWER,
+            sources=(),
+            tools_used=tools_used,
+            tool_call_count=len(trace),
+            used_no_tool=not trace,
+            outcome="safe_fallback",
+            failure_category=_MULTIPLE_TOOL_CALLS_FAILURE_CATEGORY,
         )
 
     @staticmethod

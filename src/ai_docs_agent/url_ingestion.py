@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup, Tag
 from bs4.element import NavigableString
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from ai_docs_agent.config import AppSettings
+from ai_docs_agent.config import UrlFetchSettings
 from ai_docs_agent.models import DocumentChunk, FetchedPage, UrlProcessingResult
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
@@ -298,7 +298,7 @@ class UrlIngestionService:
 
     def __init__(
         self,
-        settings: AppSettings,
+        settings: UrlFetchSettings,
         *,
         http_client: httpx.Client | None = None,
         host_resolver: HostResolver | None = None,

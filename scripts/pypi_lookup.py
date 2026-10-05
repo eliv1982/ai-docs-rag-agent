@@ -8,7 +8,7 @@ part of the automated test suite; tests inject fake services only.
 import argparse
 import sys
 
-from ai_docs_agent.config import get_settings
+from ai_docs_agent.config import ConfigurationError, PyPISettings, load_settings
 from ai_docs_agent.models import PyPIPackageInfo
 from ai_docs_agent.pypi import PyPILookupError, PyPILookupService
 
@@ -52,7 +52,11 @@ def main(argv: list[str] | None = None, *, service: PyPILookupService | None = N
     args = _parse_args(argv)
 
     if service is None:
-        service = PyPILookupService(get_settings())
+        try:
+            service = PyPILookupService(load_settings(PyPISettings))
+        except ConfigurationError as exc:
+            print(f"PyPI lookup FAILED: {exc}")
+            return 1
 
     try:
         result = service.lookup(args.package_name)

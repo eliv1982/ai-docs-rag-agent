@@ -10,7 +10,7 @@ import argparse
 import sys
 
 from ai_docs_agent.agent import AnswerServiceError, DocumentationAnswerService
-from ai_docs_agent.config import get_settings
+from ai_docs_agent.config import AnswerSettings, ConfigurationError, load_settings
 from ai_docs_agent.models import GroundedAnswerResult
 
 
@@ -74,7 +74,11 @@ def main(
     args = _parse_args(argv)
 
     if service is None:
-        service = DocumentationAnswerService(get_settings())
+        try:
+            service = DocumentationAnswerService(load_settings(AnswerSettings))
+        except ConfigurationError as exc:
+            print(f"Answer FAILED: {exc}")
+            return 1
 
     try:
         result = service.answer(args.question, top_k=args.top_k, namespace=args.namespace)

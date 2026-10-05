@@ -7,7 +7,7 @@ Does not call OpenAI or Pinecone, and does not write anything to a vector store.
 import argparse
 import sys
 
-from ai_docs_agent.config import get_settings
+from ai_docs_agent.config import ConfigurationError, UrlFetchSettings, load_settings
 from ai_docs_agent.models import UrlProcessingResult
 from ai_docs_agent.url_ingestion import UrlIngestionError, UrlIngestionService
 
@@ -44,7 +44,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None, *, service: UrlIngestionService | None = None) -> int:
     args = _parse_args(argv)
     if service is None:
-        service = UrlIngestionService(get_settings())
+        try:
+            service = UrlIngestionService(load_settings(UrlFetchSettings))
+        except ConfigurationError as exc:
+            print(f"URL preview FAILED: {exc}")
+            return 1
 
     try:
         result = service.process_url(args.url)

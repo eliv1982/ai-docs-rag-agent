@@ -12,7 +12,7 @@ succeeded but cleanup of stale page versions failed.
 import argparse
 import sys
 
-from ai_docs_agent.config import get_settings
+from ai_docs_agent.config import ConfigurationError, IndexingSettings, load_settings
 from ai_docs_agent.indexing import DocumentIndexingError, DocumentIndexingService
 from ai_docs_agent.models import DocumentIndexingResult
 from ai_docs_agent.url_ingestion import UrlIngestionError
@@ -71,7 +71,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None, *, service: DocumentIndexingService | None = None) -> int:
     args = _parse_args(argv)
     if service is None:
-        service = DocumentIndexingService(get_settings())
+        try:
+            service = DocumentIndexingService(load_settings(IndexingSettings))
+        except ConfigurationError as exc:
+            print(f"URL indexing FAILED: {exc}")
+            return 1
 
     try:
         result = service.index_url(args.url, namespace=args.namespace)

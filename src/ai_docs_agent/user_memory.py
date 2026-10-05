@@ -33,7 +33,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
-from ai_docs_agent.config import AppSettings
+from ai_docs_agent.config import UserMemorySettings
 from ai_docs_agent.models import (
     PineconeQueryMatch,
     UserMemoryMatch,
@@ -140,7 +140,7 @@ class UserMemoryService:
 
     def __init__(
         self,
-        settings: AppSettings,
+        settings: UserMemorySettings,
         *,
         pinecone_store: PineconeStore | None = None,
         clock: Callable[[], float] = time.monotonic,

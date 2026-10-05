@@ -9,7 +9,7 @@ of the automated test suite.
 import argparse
 import sys
 
-from ai_docs_agent.config import get_settings
+from ai_docs_agent.config import ConfigurationError, VectorStoreSettings, load_settings
 from ai_docs_agent.models import RetrievalResult
 from ai_docs_agent.retrieval import RetrievalError, RetrievalService
 
@@ -93,7 +93,11 @@ def main(argv: list[str] | None = None, *, service: RetrievalService | None = No
     args = _parse_args(argv)
 
     if service is None:
-        service = RetrievalService(get_settings())
+        try:
+            service = RetrievalService(load_settings(VectorStoreSettings))
+        except ConfigurationError as exc:
+            print(f"Retrieval search FAILED: {exc}")
+            return 1
 
     try:
         result = service.search(args.query, top_k=args.top_k, namespace=args.namespace)

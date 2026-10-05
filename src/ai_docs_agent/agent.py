@@ -24,7 +24,7 @@ from typing import Any, Protocol
 
 from openai import OpenAI
 
-from ai_docs_agent.config import AppSettings
+from ai_docs_agent.config import AnswerSettings
 from ai_docs_agent.models import (
     AnswerSource,
     ConversationMessage,
@@ -155,7 +155,7 @@ class ChatClient(Protocol):
 class OpenAIChatClient:
     """Wraps the installed OpenAI SDK's chat-completions API."""
 
-    def __init__(self, settings: AppSettings) -> None:
+    def __init__(self, settings: AnswerSettings) -> None:
         self._settings = settings
         self._client: OpenAI | None = None
 
@@ -163,7 +163,8 @@ class OpenAIChatClient:
     def _openai_client(self) -> OpenAI:
         if self._client is None:
             kwargs: dict[str, Any] = {
-                "api_key": self._settings.openai_api_key.get_secret_value()
+                "api_key": self._settings.openai_api_key.get_secret_value(),
+                "timeout": self._settings.openai_timeout_seconds,
             }
             if self._settings.openai_base_url is not None:
                 kwargs["base_url"] = self._settings.openai_base_url
@@ -186,7 +187,7 @@ class DocumentationAnswerService:
 
     def __init__(
         self,
-        settings: AppSettings,
+        settings: AnswerSettings,
         *,
         retrieval_service: RetrievalService | None = None,
         chat_client: ChatClient | None = None,

@@ -9,9 +9,12 @@ import json
 import logging
 from typing import Any
 
+import httpx
 import pytest
+from langchain.agents import create_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
+from langchain_openai import ChatOpenAI
 from pydantic import Field
 
 from ai_docs_agent.agent import AnswerGenerationError
@@ -474,3 +477,218 @@ def test_agent_result_model_supports_safe_fallback_without_tool_use() -> None:
     )
 
     assert result.used_no_tool is True
+
+
+# --- one-tool-call contract (real create_agent graph) ----------------------------------
+
+_MULTI_CALL_CATEGORY = "multiple_tool_calls"
+
+
+def make_multi_tool_call_message(*calls: tuple[str, dict[str, Any]]) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {"name": name, "args": args, "id": f"call_{index}", "type": "tool_call"}
+            for index, (name, args) in enumerate(calls, start=1)
+        ],
+    )
+
+
+_DOCS_CALL = ("documentation_search", {"question": "Что такое embeddings?"})
+_PYPI_CALL = ("pypi_lookup", {"package_name": "httpx"})
+_PARALLEL_CALL_ORDERS = [
+    pytest.param([_DOCS_CALL, _PYPI_CALL], id="docs-then-pypi"),
+    pytest.param([_PYPI_CALL, _DOCS_CALL], id="pypi-then-docs"),
+    pytest.param([_DOCS_CALL, _DOCS_CALL], id="docs-twice"),
+]
+
+
+def _agent_with_parallel_attempt(
+    calls: list[tuple[str, dict[str, Any]]],
+    *,
+    agent_factory: Any = create_agent,
+) -> tuple[LangChainToolCallingAgent, ToolFriendlyFakeModel, Any, Any]:
+    model = ToolFriendlyFakeModel(
+        responses=[
+            make_multi_tool_call_message(*calls),
+            AIMessage(content="This second response should never be needed."),
+        ]
+    )
+    documentation_service = FakeDocumentationService(result=make_grounded_result())
+    pypi_service = FakePyPIService(result=make_pypi_info())
+    agent = LangChainToolCallingAgent(
+        make_settings(),
+        documentation_service=documentation_service,
+        pypi_service=pypi_service,
+        chat_model=model,
+        agent_factory=agent_factory,
+    )
+    return agent, model, documentation_service, pypi_service
+
+
+def test_agent_asks_the_provider_not_to_emit_parallel_tool_calls() -> None:
+    model = ToolFriendlyFakeModel(
+        responses=[make_tool_call_message("pypi_lookup", {"package_name": "httpx"})]
+    )
+    agent, _documentation_service, _pypi_service = make_agent(model=model)
+
+    result = agent.answer("Какая последняя версия пакета httpx на PyPI?")
+
+    assert result.outcome == "success"
+    assert model.bind_tools_calls
+    assert model.bind_tools_calls[0]["kwargs"]["parallel_tool_calls"] is False
+
+
+@pytest.mark.parametrize("calls", _PARALLEL_CALL_ORDERS)
+def test_parallel_tool_calls_are_rejected_before_any_tool_executes(
+    calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    agent, _model, documentation_service, pypi_service = _agent_with_parallel_attempt(calls)
+
+    result = agent.answer("Что такое embeddings и какая последняя версия httpx на PyPI?")
+
+    # Nothing ran, so no side effect can have happened, and the answer is the
+    # fixed safe fallback rather than whichever call happened to be first/last.
+    assert documentation_service.calls == []
+    assert pypi_service.calls == []
+    assert result.outcome == "safe_fallback"
+    assert result.failure_category == _MULTI_CALL_CATEGORY
+    assert result.tool_call_count == 0
+    assert result.tools_used == ()
+    assert result.used_no_tool is True
+    assert result.sources == ()
+    assert "9.9.9" not in result.answer
+    assert "Embeddings" not in result.answer
+
+
+def test_rejected_parallel_tool_calls_give_the_same_result_in_any_order() -> None:
+    results = []
+    for calls in ([_DOCS_CALL, _PYPI_CALL], [_PYPI_CALL, _DOCS_CALL]):
+        agent, *_services = _agent_with_parallel_attempt(calls)
+        results.append(agent.answer("Что такое embeddings и какая версия httpx на PyPI?"))
+
+    assert results[0] == results[1]
+
+
+def _create_agent_without_guard(**kwargs: Any) -> Any:
+    kwargs.pop("middleware")
+    return create_agent(**kwargs)
+
+
+def test_defensive_fallback_is_order_independent_even_if_parallel_calls_execute() -> None:
+    """Second line of defence: if an unguarded graph ran several tools anyway."""
+    results = []
+    for calls in ([_DOCS_CALL, _PYPI_CALL], [_PYPI_CALL, _DOCS_CALL]):
+        agent, _model, documentation_service, pypi_service = _agent_with_parallel_attempt(
+            calls, agent_factory=_create_agent_without_guard
+        )
+        result = agent.answer("Что такое embeddings и какая версия httpx на PyPI?")
+        results.append(result)
+
+        # Both tools genuinely ran in this unguarded graph...
+        assert documentation_service.calls == [_DOCS_CALL[1]["question"]]
+        assert pypi_service.calls == ["httpx"]
+        # ...yet the answer is neither tool's output.
+        assert result.outcome == "safe_fallback"
+        assert result.failure_category == _MULTI_CALL_CATEGORY
+        assert result.tool_call_count == 2
+        assert result.tools_used == ("documentation_search", "pypi_lookup")
+        assert "9.9.9" not in result.answer
+        assert "Embeddings" not in result.answer
+        assert result.sources == ()
+
+    assert results[0] == results[1]
+
+
+def _openai_tool_call(index: int, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": f"call_{index}",
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }
+
+
+def _real_chat_openai_over_mock_transport(
+    tool_calls: list[dict[str, Any]], payloads: list[dict[str, Any]]
+) -> ChatOpenAI:
+    """A real ChatOpenAI whose HTTP layer is a local mock: no network, real payloads."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-mini",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    return ChatOpenAI(
+        model="gpt-4o-mini",
+        api_key="sk-test-openai",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def test_real_chat_openai_request_disables_parallel_tool_calls() -> None:
+    payloads: list[dict[str, Any]] = []
+    chat_model = _real_chat_openai_over_mock_transport(
+        [_openai_tool_call(1, "pypi_lookup", {"package_name": "httpx"})], payloads
+    )
+    pypi_service = FakePyPIService(result=make_pypi_info())
+    agent = LangChainToolCallingAgent(
+        make_settings(),
+        documentation_service=FakeDocumentationService(result=make_grounded_result()),
+        pypi_service=pypi_service,
+        chat_model=chat_model,
+    )
+
+    result = agent.answer("Какая последняя версия пакета httpx на PyPI?")
+
+    assert result.outcome == "success"
+    assert pypi_service.calls == ["httpx"]
+    assert payloads[0]["parallel_tool_calls"] is False
+    assert {tool["function"]["name"] for tool in payloads[0]["tools"]} == {
+        "documentation_search",
+        "pypi_lookup",
+    }
+
+
+def test_real_chat_openai_parallel_response_is_rejected_without_running_tools() -> None:
+    """Even a provider that ignores parallel_tool_calls=false cannot get two tools run."""
+    payloads: list[dict[str, Any]] = []
+    chat_model = _real_chat_openai_over_mock_transport(
+        [
+            _openai_tool_call(1, "documentation_search", {"question": "Что такое embeddings?"}),
+            _openai_tool_call(2, "pypi_lookup", {"package_name": "httpx"}),
+        ],
+        payloads,
+    )
+    documentation_service = FakeDocumentationService(result=make_grounded_result())
+    pypi_service = FakePyPIService(result=make_pypi_info())
+    agent = LangChainToolCallingAgent(
+        make_settings(),
+        documentation_service=documentation_service,
+        pypi_service=pypi_service,
+        chat_model=chat_model,
+    )
+
+    result = agent.answer("Что такое embeddings и какая версия httpx на PyPI?")
+
+    assert len(payloads) == 1  # the graph stopped after the rejected model step
+    assert documentation_service.calls == []
+    assert pypi_service.calls == []
+    assert result.outcome == "safe_fallback"
+    assert result.failure_category == _MULTI_CALL_CATEGORY
+    assert result.tool_call_count == 0

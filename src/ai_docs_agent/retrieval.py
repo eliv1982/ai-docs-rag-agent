@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ai_docs_agent.config import AppSettings
+from ai_docs_agent.config import VectorStoreSettings
 from ai_docs_agent.models import PineconeQueryMatch, RetrievalResult, RetrievedChunk
 from ai_docs_agent.pinecone_store import PineconeStore, PineconeStoreError
 
@@ -51,7 +51,7 @@ class RetrievalService:
 
     def __init__(
         self,
-        settings: AppSettings,
+        settings: VectorStoreSettings,
         *,
         pinecone_store: PineconeStore | None = None,
     ) -> None:

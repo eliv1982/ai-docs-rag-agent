@@ -9,7 +9,7 @@ from typing import Any, Protocol
 from langchain_openai import OpenAIEmbeddings
 from pinecone import Pinecone, ServerlessSpec
 
-from ai_docs_agent.config import AppSettings
+from ai_docs_agent.config import VectorStoreSettings
 from ai_docs_agent.models import PineconeIndexStatus, PineconeQueryMatch, PineconeSmokeTestResult
 
 _SMOKE_TEST_TEXT = "AI Docs RAG Agent Pinecone integration smoke test."
@@ -78,7 +78,7 @@ class PineconeStore:
 
     def __init__(
         self,
-        settings: AppSettings,
+        settings: VectorStoreSettings,
         *,
         client: PineconeClient | None = None,
         embeddings: EmbeddingsClient | None = None,
@@ -104,6 +104,7 @@ class PineconeStore:
             kwargs: dict[str, Any] = {
                 "model": self._settings.openai_embedding_model,
                 "api_key": self._settings.openai_api_key.get_secret_value(),
+                "timeout": self._settings.openai_timeout_seconds,
             }
             if self._settings.openai_base_url is not None:
                 kwargs["base_url"] = self._settings.openai_base_url

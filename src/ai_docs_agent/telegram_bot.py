@@ -14,12 +14,25 @@ stored, and Pinecone namespaces/record IDs/identity digests/top_k/model names
 are never exposed to chat users. No URL indexing or admin controls are
 implemented here.
 
+The bot is a private-chat assistant: str(chat_id) is only a personal identity
+in a private chat, so every handler is registered for new private-chat messages
+only. Group, supergroup and channel updates and edited messages are never
+dispatched, so they can never reach the agent, write memory, or reset history.
+
+The integrated service is synchronous and makes blocking network calls, so each
+request runs on a worker thread (asyncio.to_thread) and never stalls the event
+loop; the request-scoped context (logging session hash, memory identity) is
+bound inside that thread. PTB still processes updates one at a time, which the
+in-memory short-term store relies on (it has no locking), so concurrent_updates
+must stay off unless that store is made thread-safe first.
+
 Importing this module builds nothing and makes no network calls: settings,
 the integrated service graph, and the Telegram Application are all
 constructed lazily by build_application()/run_bot(), which are the only
 explicit startup entry points.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -70,6 +83,10 @@ _RESET_CONFIRMATION = (
 _ANSWER_FAILURE_MESSAGE = "Не удалось подготовить ответ. Попробуйте повторить запрос позже."
 
 _MEMORY_SOURCE_LABEL = "Источник: ваше сохранённое предпочтение (персональная память)"
+
+# New (non-edited) messages in a private chat only: excludes groups, supergroups,
+# channel posts and every edited_* update.
+_PRIVATE_MESSAGE = filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE
 
 logger = logging.getLogger(__name__)
 
@@ -172,9 +189,9 @@ class TelegramBotService:
             pass  # the typing indicator is best-effort only
 
         try:
-            with request_logging_context(session_id=session_id):
-                result = self._integrated_service.handle_message(session_id, question)
-                response_text = format_integrated_answer(result)
+            response_text = await asyncio.to_thread(
+                self._run_integrated_flow, session_id, question
+            )
         except Exception as exc:
             # Expected domain failures arrive as IntegratedAgentError; anything
             # else is mapped to the same safe user-facing message so the bot
@@ -192,6 +209,12 @@ class TelegramBotService:
 
         for part in split_telegram_message(response_text):
             await self._reply(update, part)
+
+    def _run_integrated_flow(self, session_id: str, question: str) -> str:
+        """Run the blocking integrated flow; called on a worker thread, not the loop."""
+        with request_logging_context(session_id=session_id):
+            result = self._integrated_service.handle_message(session_id, question)
+            return format_integrated_answer(result)
 
     @staticmethod
     def _session_id(update: Update) -> str:
@@ -237,10 +260,16 @@ def build_application(
     application.bot_data[_STARTUP_SUMMARY_BOT_DATA_KEY] = build_startup_summary(
         resolved_settings
     )
-    application.add_handler(CommandHandler("start", bot_service.handle_start))
-    application.add_handler(CommandHandler("reset", bot_service.handle_reset))
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, bot_service.handle_text)
+        CommandHandler("start", bot_service.handle_start, filters=_PRIVATE_MESSAGE)
+    )
+    application.add_handler(
+        CommandHandler("reset", bot_service.handle_reset, filters=_PRIVATE_MESSAGE)
+    )
+    application.add_handler(
+        MessageHandler(
+            _PRIVATE_MESSAGE & filters.TEXT & ~filters.COMMAND, bot_service.handle_text
+        )
     )
     return application
 

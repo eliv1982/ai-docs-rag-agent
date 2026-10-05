@@ -8,7 +8,7 @@ agent selects that tool.
 import argparse
 import sys
 
-from ai_docs_agent.config import get_settings
+from ai_docs_agent.config import AgentSettings, ConfigurationError, load_settings
 from ai_docs_agent.langchain_agent import LangChainAgentExecutionError, LangChainToolCallingAgent
 from ai_docs_agent.models import LangChainAgentResult
 
@@ -60,8 +60,11 @@ def main(
     args = _parse_args(argv)
 
     try:
-        resolved_service = service or LangChainToolCallingAgent(get_settings())
+        resolved_service = service or LangChainToolCallingAgent(load_settings(AgentSettings))
         result = resolved_service.answer(args.question)
+    except ConfigurationError as exc:
+        print(f"Agent FAILED: {exc}")
+        return 1
     except LangChainAgentExecutionError:
         print("Agent FAILED: unexpected orchestration error")
         return 1

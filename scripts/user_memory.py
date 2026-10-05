@@ -13,7 +13,7 @@ inject a fake service only.
 import argparse
 import sys
 
-from ai_docs_agent.config import get_settings
+from ai_docs_agent.config import ConfigurationError, UserMemorySettings, load_settings
 from ai_docs_agent.models import UserMemoryRecallResult, UserMemoryWriteResult
 from ai_docs_agent.user_memory import UserMemoryError, UserMemoryService
 
@@ -85,12 +85,15 @@ def main(argv: list[str] | None = None, *, service: UserMemoryService | None = N
 
     try:
         if service is None:
-            service = UserMemoryService(get_settings())
+            service = UserMemoryService(load_settings(UserMemorySettings))
 
         if args.operation == "remember":
             lines = format_write_report(service.remember(args.user_identifier, args.statement))
         else:
             lines = format_recall_report(service.recall(args.user_identifier, args.query))
+    except ConfigurationError as exc:
+        print(f"User memory FAILED: {exc}")
+        return 1
     except UserMemoryError as exc:
         print(f"User memory FAILED: {exc}")
         return 1

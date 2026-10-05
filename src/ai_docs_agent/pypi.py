@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from ai_docs_agent.config import AppSettings
+from ai_docs_agent.config import PyPISettings
 from ai_docs_agent.models import PyPIPackageInfo
 
 _PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,199})?$")
@@ -154,7 +154,7 @@ def _resolve_project_url(info: dict[str, Any], *, pypi_url: str) -> str | None:
 class PyPILookupService:
     """Fetches typed package metadata from the PyPI JSON API."""
 
-    def __init__(self, settings: AppSettings, *, http_client: httpx.Client | None = None) -> None:
+    def __init__(self, settings: PyPISettings, *, http_client: httpx.Client | None = None) -> None:
         self._settings = settings
         self._injected_client = http_client
 

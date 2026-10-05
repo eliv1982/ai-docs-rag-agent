@@ -1,4 +1,4 @@
-"""Telegram interface over the final integrated agent flow (Stage 4I).
+"""Telegram interface over the integrated agent flow.
 
 Pipeline: Telegram text message -> str(chat_id) as session_id ->
 IntegratedConversationAgentService.handle_message() -> either the deterministic

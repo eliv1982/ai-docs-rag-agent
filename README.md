@@ -1,964 +1,355 @@
 # AI Docs RAG Agent
 
-Telegram RAG-агент для работы с технической документацией.
+[![CI](https://github.com/eliv1982/ai-docs-rag-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eliv1982/ai-docs-rag-agent/actions/workflows/ci.yml)
 
-**Статус: typed configuration + Pinecone index management/smoke-test + URL ingestion/chunking
-+ URL indexing into Pinecone (fetch → embeddings → upsert → verify → cleanup) + typed
-read-only semantic search (`RetrievalService.search`) + minimal grounded RAG answering
-(`DocumentationAnswerService.answer`) + short-term in-memory conversation memory
-(`ConversationAnswerService`) + minimal Telegram bot MVP (`TelegramBotService`,
-`python-telegram-bot`) + typed read-only PyPI JSON lookup (`PyPILookupService`,
-`lookup_pypi_package`, `scripts/pypi_lookup.py`) + real LangChain tool-calling agent
-(`LangChainToolCallingAgent`, `scripts/ask_agent.py`) + controlled long-term user vector
-memory in Pinecone (`UserMemoryService`, `scripts/user_memory.py`) + финальный
-интегрированный поток (Stage 4I): Telegram-бот работает через
-`IntegratedConversationAgentService` — LangChain agent с тремя инструментами
-(`documentation_search`, `pypi_lookup`, request-scoped `user_memory_recall`),
-детерминированная команда `Запомни: ...` для явной записи долговременной памяти,
-короткая память диалога и `/reset`, который очищает только контекст диалога.**
-
-## Планируемые возможности
-
-- приём URL страниц документации;
-- загрузка и очистка HTML;
-- разбиение текста на чанки;
-- создание embeddings;
-- хранение данных в Pinecone;
-- семантический поиск;
-- генерация grounded-ответов по найденному контексту;
-- контролируемая пользовательская память;
-- интерфейс через Telegram.
-
-## Архитектурный статус
-
-Реализованы: URL ingestion, HTML parsing, чанкинг, создание embeddings и запись чанков в
-Pinecone (`DocumentIndexingService.index_url`), типизированный read-only семантический поиск
-по уже проиндексированным чанкам (`RetrievalService.search`, см. ниже), минимальный
-grounded RAG answering поверх retrieval (`DocumentationAnswerService.answer`, см. ниже),
-короткая process-local разговорная память по `session_id` (`ConversationAnswerService`, см.
-ниже), минимальный Telegram bot MVP (`TelegramBotService`, см. ниже) поверх того же
-`ConversationAnswerService`, а также typed read-only PyPI lookup (`PyPILookupService`,
-`lookup_pypi_package`, см. ниже) и полноценный LangChain tool-calling agent
-(`LangChainToolCallingAgent`, см. ниже). Telegram-бот на этом этапе по-прежнему использует
-существующий `ConversationAnswerService`, а не новый agent layer.
-
-На данном этапе реализовано:
-
-- типизированная конфигурация приложения (`AppSettings`, `pydantic-settings`);
-- управление Pinecone-индексом (`PineconeStore.ensure_index`);
-- live-интеграционный smoke-test: OpenAI embedding → Pinecone upsert → query → cleanup
-  (`PineconeStore.smoke_test`);
-- URL ingestion и chunking pipeline (`UrlIngestionService.process_url`): валидация URL,
-  ограниченная по размеру и redirect'ам загрузка HTML, извлечение и нормализация текста,
-  детерминированные ID документа/чанков и разбиение на чанки;
-- индексация URL в Pinecone (`DocumentIndexingService.index_url`): URL → chunks (через
-  `UrlIngestionService`) → batch OpenAI embeddings → batch Pinecone upsert → bounded
-  fetch-verification → удаление устаревших версий той же страницы;
-- типизированный read-only семантический поиск (`RetrievalService.search`): query text →
-  OpenAI query embedding → Pinecone similarity query → строго провалидированные
-  `RetrievedChunk` (см. ниже);
-- минимальный grounded RAG answering (`DocumentationAnswerService.answer`): question →
-  `RetrievalService.search` → grounded LLM prompt → одна text-ответ chat completion →
-  `GroundedAnswerResult` с детерминированным списком источников (см. ниже);
-- типизированный read-only PyPI lookup (`PyPILookupService.lookup`, `lookup_pypi_package`,
-  см. ниже): package name → реальный GET `https://pypi.org/pypi/{package_name}/json` →
-  `PyPIPackageInfo` c безопасным domain error mapping;
-- real LangChain tool-calling orchestration (`LangChainToolCallingAgent`,
-  `scripts/ask_agent.py`, см. ниже): natural-language request → autonomous single-tool
-  selection между `documentation_search` и `pypi_lookup` → детерминированный
-  пользовательский ответ из authoritative tool result → `LangChainAgentResult`;
-- короткая process-local разговорная память по `session_id` (`ConversationAnswerService`,
-  `InMemoryConversationMemory`, см. ниже): последние сообщения диалога подставляются в промпт
-  для continuity, но никогда не считаются документальным фактом;
-- минимальный Telegram bot MVP (`TelegramBotService`, `python-telegram-bot`, см. ниже):
-  `/start`, `/reset` и обычные текстовые вопросы поверх того же `ConversationAnswerService`
-  (`chat_id` используется как `session_id`).
-
-`tools.py` теперь содержит тонкие typed adapters `answer_documentation_question(...)` и
-`lookup_pypi_package(...)`; реальная LangChain agent orchestration реализована отдельно в
-`src/ai_docs_agent/langchain_agent.py`.
-
-### URL ingestion и chunking pipeline
-
-`src/ai_docs_agent/url_ingestion.py` определяет `UrlIngestionService.process_url(url)`,
-реализующий pipeline:
+A Telegram assistant for **technical documentation you index yourself**: SSRF-aware URL
+ingestion into Pinecone, grounded RAG answers with deterministically generated source links,
+and a bounded, read-only tool-calling agent behind a private-chat Telegram interface.
 
 ```
-URL → validation (scheme/host/SSRF guard) → bounded-redirect HTTP fetch →
-bounded response size → HTML extraction → normalized text →
-deterministic document ID → RecursiveCharacterTextSplitter → deterministic chunks
+documentation URL → SSRF-aware fetch → deterministic Pinecone lifecycle
+   → grounded RAG → bounded tool-calling agent → Telegram (private chats)
 ```
 
-Результат — `UrlProcessingResult` с готовыми `DocumentChunk` в памяти. Ничего не
-записывается в Pinecone и не отправляется в OpenAI на этом этапе.
+It is a portfolio project, not a hosted service or a generic chatbot. The bot answers from the
+documentation in your own index, looks up current PyPI metadata, and (secondarily) recalls
+preferences a user explicitly asked it to remember. Everything else gets a fixed fallback.
 
-**SSRF guard — best-effort защита, а не абсолютная гарантия безопасности.** Проверяются
-схема (`http`/`https`), отсутствие credentials в URL, `localhost`/`*.localhost`, и все
-resolved-адреса hostname (через injectable DNS resolver) на loopback/private/link-local/
-multicast/reserved/unspecified диапазоны — при каждом redirect повторно. Hostname перед
-всеми этими проверками (и перед вызовом resolver'а) нормализуется: lowercase и удаление
-конечных точек — это закрывает обход вида `localhost.`/`LOCALHOST.`/`app.localhost.`, при
-котором literal-проверка ранее выполнялась до нормализации. Это снижает риск базовых
-SSRF-сценариев, но не заменяет сетевые egress-ограничения на инфраструктурном уровне
-(например, DNS rebinding между проверкой и фактическим TCP-соединением остаётся
-теоретически возможным).
+## What makes it distinctive
 
-Поддерживаемые `Content-Type`: `text/html`, `application/xhtml+xml` (с необязательным
-`charset`). Остальные типы отклоняются (`UnsupportedContentTypeError`). Неизвестный или
-невалидный `charset` (например, `charset=definitely-not-a-codec`) не приводит к raw
-`LookupError` — тело ответа при этом не читается силой в случайной кодировке, а fetch
-завершается controlled-ошибкой `ContentExtractionError` (с исходным `LookupError` в
-`__cause__`, без утечки HTML body).
+- **Safe ingestion.** Operators index public documentation URLs through a fetcher that
+  validates URL and DNS answers, re-validates every redirect, and bounds response size.
+  Telegram users have no way to make the bot fetch a URL.
+- **Deterministic document lifecycle.** Document and chunk IDs are SHA-256 derived, re-indexing
+  is idempotent, writes are verified by fetching the IDs back, and stale versions of the same
+  page are removed afterwards.
+- **Grounding with an honest contract.** Retrieval is filtered to documentation records,
+  scored against a configurable relevance threshold, and answered from the retrieved context.
+  With no useful evidence no answer is generated and a fixed fallback is returned. Source
+  links come from stored metadata, never from model output.
+- **A bounded agent, enforced in code.** Three read-only tools, at most one tool execution
+  per request, and parallel multi-tool output is rejected deterministically rather than
+  trusted to the prompt.
+- **Privacy-minded memory and logging.** Long-term memory is explicit-write only, namespaced per
+  chat by an HMAC of the chat ID, and logs carry only keyed, truncated session hashes.
+- **Tested without credentials.** The whole suite runs offline against fakes; CI runs lint and
+  the tests on Python 3.11 and 3.12 with no secrets.
 
-Извлечение текста нормализует обычную prose (схлопывание пробелов/пустых строк), но
-сохраняет форматирование блоков `<pre>`/`<pre><code>` (значимые leading-отступы и
-внутренняя индентация не удаляются) — это важно для технической документации с
-примерами кода/конфигов.
+## Architecture
 
-Ограничения (настраиваются через `.env`, см. ниже):
+```mermaid
+flowchart TB
+  subgraph ING["Operator ingestion (scripts/index_url.py)"]
+    U["Documentation URL"] --> V["URL + DNS validation"]
+    V --> F["Bounded fetch<br/>redirects re-validated"]
+    F --> X["Extract + chunk"]
+    X --> E["OpenAI embeddings"]
+    E --> D[("Pinecone<br/>documentation namespace")]
+    D --> W["Post-write verification"]
+    W --> C["Stale-version cleanup"]
+  end
 
-- `URL_FETCH_TIMEOUT_SECONDS` — таймаут HTTP-запроса;
-- `URL_MAX_RESPONSE_BYTES` — лимит размера тела ответа (проверяется по `Content-Length` до
-  чтения тела **и** по фактически прочитанным байтам во время потокового чтения — чтение
-  прекращается сразу при превышении);
-- `URL_MAX_REDIRECTS` — максимум HTTP-redirect'ов (redirect обрабатывается вручную,
-  `follow_redirects=False`; каждый redirect-target заново проходит полную URL/DNS
-  валидацию);
-- `URL_MIN_TEXT_CHARS` — минимальная длина извлечённого текста;
-- `CHUNK_SIZE` / `CHUNK_OVERLAP` — параметры `RecursiveCharacterTextSplitter`.
+  subgraph TG["Telegram bot (private chats only)"]
+    M["Private message"] --> S["Integrated conversation service"]
+    S -->|"Remember: / Запомни:"| R["Deterministic validation<br/>per-chat HMAC namespace"]
+    R --> MEM[("Pinecone<br/>per-chat memory namespace")]
+    S -->|"anything else"| A["Bounded agent<br/>at most one tool call"]
+    A --> T1["documentation_search"]
+    A --> T2["pypi_lookup"]
+    A --> T3["user_memory_recall"]
+    T1 --> O["Deterministic rendering<br/>answer + source list"]
+    T2 --> O
+    T3 --> O
+  end
 
-Document ID и chunk ID детерминированы (SHA-256 от `final_url` + content hash) — одна и та
-же страница с тем же содержимым всегда даёт одни и те же ID; изменившийся контент даёт
-новый document ID.
-
-Предпросмотр pipeline без записи куда-либо:
-
-```
-python scripts/url_preview.py "https://example.com/docs"
-```
-
-### URL indexing в Pinecone
-
-`src/ai_docs_agent/indexing.py` определяет `DocumentIndexingService.index_url(url, *,
-namespace=None)`, реализующий полный pipeline:
-
-```
-URL → UrlIngestionService.process_url → DocumentChunk[] →
-batch OpenAI embeddings (PineconeStore.embed_documents) →
-batch Pinecone upsert (PineconeStore.upsert_vectors) →
-bounded fetch-verification (PineconeStore.fetch_existing_ids) →
-удаление устаревших версий той же страницы (PineconeStore.delete_vectors_by_filter)
+  D -.-> T1
+  T2 -.-> PY(["PyPI JSON API"])
+  MEM -.-> T3
 ```
 
-Сервис не дублирует URL validation/HTML extraction/chunking (переиспользует
-`UrlIngestionService`) и не создаёт отдельный Pinecone/OpenAI client layer (переиспользует
-`PineconeStore`, расширенный низкоуровневыми методами `embed_documents`, `upsert_vectors`,
-`fetch_existing_ids`, `delete_vectors_by_filter`).
-
-**Namespace.** По умолчанию используется `PINECONE_DOCUMENTS_NAMESPACE` (`documentation`);
-можно передать явный namespace (`index_url(url, namespace=...)` / `--namespace` в CLI) — он
-проверяется на пустоту **до** любого сетевого вызова.
-
-**Batching.** Embeddings создаются батчами по `EMBEDDING_BATCH_SIZE`, upsert выполняется
-батчами по `PINECONE_UPSERT_BATCH_SIZE`, verification (fetch) — батчами по
-`PINECONE_FETCH_BATCH_SIZE` (максимум 1000 за один Pinecone `fetch`). Порядок chunk ↔
-embedding ↔ upsert-record сохраняется даже при разных размерах батчей на разных этапах.
-`embed_documents` не обращается к Pinecone control-plane — только к embeddings client.
-
-**Один переиспользуемый Pinecone index handle.** В рамках одного `PineconeStore` instance
-control-plane readiness (`ensure_index()` + получение index handle) выполняется лениво только
-при первом data-plane вызове (upsert/fetch/delete) и кешируется; последующие upsert/fetch/delete
-на этом же instance переиспользуют закешированный handle без повторных `has_index`/
-`describe_index`. Если data-plane вызов падает с SDK-ошибкой, кеш инвалидируется, и следующий
-самостоятельный вызов заново проверяет readiness. Кеш принадлежит конкретному instance —
-глобального singleton нет.
-
-**Верификация (cumulative).** После upsert сервис ограниченным polling (bounded, без реальных
-задержек в тестах) проверяет через `fetch`, что все ожидаемые chunk ID появились в индексе —
-подтверждённые ID накапливаются между раундами (а не пересчитываются заново на каждом раунде),
-поэтому если один ID виден на раунде 1, а другой — только на раунде 2, верификация всё равно
-успешно завершается. Таймаут и интервал берутся из `PINECONE_INDEX_VERIFY_TIMEOUT_SECONDS` /
-`PINECONE_INDEX_VERIFY_POLL_INTERVAL_SECONDS`. При таймауте выбрасывается
-`DocumentVerificationError` с cumulative числом найденных/ожидаемых записей, namespace и
-document ID (без секретов).
-
-**Cleanup устаревших записей.** Если `PINECONE_REPLACE_OLD_SOURCE_VERSIONS=true` (по
-умолчанию), после успешного upsert и verification сервис удаляет из того же namespace все
-записи того же `source_url`, которые либо принадлежат другой версии документа (другой
-`document_id`), либо являются устаревшими чанками **текущего** документа с `chunk_index` вне
-текущего `chunk_count` (например, если после изменения конфигурации чанкинга разбиение
-страницы уменьшилось с 5 чанков до 4, а текст/`content_hash` не изменились — chunk 4 из
-старого разбиения всё равно будет удалён). Текущие чанки (`chunk_index < chunk_count`) и
-записи с другим `source_url` не затрагиваются; повторная индексация неизменённой страницы
-остаётся идемпотентной. Document ID и chunk ID детерминированы (SHA-256 от `final_url` +
-content hash), поэтому повторный запуск безопасно перезаписывает те же записи.
-
-Если cleanup завершился ошибкой **после** успешного upsert и verification, ошибка не
-скрывает уже выполненную успешную индексацию: `DocumentIndexingResult` возвращается с
-`old_versions_cleanup_succeeded=False`, а CLI-скрипт завершается с exit code `2`.
-
-**Известное ограничение: между batch-операциями upsert нет транзакционности.** Если сетевая
-ошибка происходит между Pinecone upsert-батчами, часть новых записей текущей версии страницы
-может быть уже записана. Так как chunk ID детерминированы, безопасный повторный запуск
-`index_url` для того же URL перезапишет те же записи (upsert идемпотентен по ID) — данные не
-задваиваются, но частично записанная попытка не считается успешной (выбрасывается
-`DocumentUpsertError`) и не запускает cleanup.
-
-**Известное ограничение: race между параллельными writer'ами.** `index_url` не использует
-distributed locking — если два процесса одновременно индексируют один и тот же `source_url`
-(например, старую и новую версию контента), их upsert/verification/cleanup шаги могут
-чередоваться, и cleanup одного запуска потенциально может удалить записи, которые только что
-записал другой. Для одного writer'а на URL за раз (типичный сценарий для этого этапа) это не
-проблема.
-
-Индексация URL (live, требует реальных OpenAI/Pinecone ключей):
-
-```
-python scripts/index_url.py "https://example.com/docs"
-python scripts/index_url.py "https://example.com/docs" --namespace documentation
-```
-
-### Semantic search (retrieval)
-
-`src/ai_docs_agent/retrieval.py` определяет `RetrievalService.search(query, *, top_k=None,
-namespace=None) -> RetrievalResult`, реализующий read-only pipeline:
-
-```
-query text → validation → OpenAI query embedding (PineconeStore.embed_query) →
-Pinecone similarity query (PineconeStore.query_similar, всегда с filter
-{"kind": {"$eq": "documentation_chunk"}}) → строгая проверка metadata каждого match →
-RetrievedChunk[] → RetrievalResult
-```
-
-Сервис переиспользует существующие `PineconeStore` (расширенный низкоуровневыми методами
-`embed_query` и `query_similar`) и настройки индекса/namespace/embedding-модели/dimension —
-отдельных retrieval-специфичных Pinecone/embedding настроек нет, кроме `RETRIEVAL_TOP_K`.
-
-**Обязательный фильтр.** Каждый запрос всегда ограничен `filter={"kind": {"$eq":
-"documentation_chunk"}}` — это защищает от попадания в результаты не-документных записей
-(например, тестовых векторов из `PineconeStore.smoke_test`, которые помечены
-`kind="integration_smoke_test"` и обычно живут в отдельном `PINECONE_SMOKE_NAMESPACE`).
-Фильтр внутренний и не настраивается через `search()` или CLI.
-
-**top_k.** По умолчанию — `RETRIEVAL_TOP_K` (`1..50`, по умолчанию `5`); можно передать
-`top_k` явно (`search(query, top_k=...)` / `--top-k` в CLI). Namespace по умолчанию —
-`PINECONE_DOCUMENTS_NAMESPACE`, можно переопределить (`namespace=...` / `--namespace`).
-`len(RetrievalResult.matches)` может быть меньше `top_k` (обычный случай для небольшого
-индекса или редкого запроса) — это не ошибка; пустой результат тоже считается успешным.
-
-**Score.** `score` — непрозрачное (opaque) численное значение, возвращаемое Pinecone
-как есть; используется только для сохранения порядка (Pinecone возвращает matches уже
-отсортированными от наиболее похожего к наименее похожему). Сам `RetrievalService` **не**
-применяет порог, ранжирование или дедупликацию по score — он возвращает raw matches как есть.
-Минимальный relevance gate применяется уровнем выше, в `DocumentationAnswerService` (см. ниже).
-
-**Устаревшие/дублирующиеся чанки.** Retrieval не выполняет собственной очистки — за
-отсутствие устаревших версий страницы в индексе отвечает cleanup на этапе индексации
-(`DocumentIndexingService.index_url`, см. выше), который по умолчанию включён
-(`PINECONE_REPLACE_OLD_SOURCE_VERSIONS=true`), но является best-effort (может быть отключён,
-или не завершиться, если запись была прервана, или произойти гонка при параллельной
-переиндексации той же страницы). Поэтому в редких случаях результаты поиска теоретически
-могут содержать устаревшие записи — это ограничение унаследовано от indexing-этапа, а не
-специфично для retrieval.
-
-Поиск по индексу (live, требует реальных OpenAI/Pinecone ключей; строго read-only — не
-выполняет upsert/delete/переиндексацию):
-
-```
-python scripts/search_query.py "how do I configure the client?"
-python scripts/search_query.py "how do I configure the client?" --top-k 3 --namespace documentation
-```
-
-### Grounded RAG answering
-
-`src/ai_docs_agent/agent.py` определяет `DocumentationAnswerService.answer(question, *,
-top_k=None, namespace=None) -> GroundedAnswerResult`, реализующий минимальный grounded
-answering pipeline:
-
-```
-question → direct RetrievalService.search() →
-если accepted-контекста нет и есть recent history: один bounded contextual retry
-с standalone retrieval query, выведенным из history + current question →
-retrieved RetrievedChunk[] → компактный grounded system+user prompt
-(текст чанков — untrusted data, не instructions) →
-один plain-text chat completion (OpenAI Chat Completions API) →
-GroundedAnswerResult { answer, sources, retrieved_chunk_count }
-```
-
-Сервис переиспользует `RetrievalService` (не дублирует retrieval-логику или обязательный
-`documentation_chunk` filter) и принимает chat-клиент через dependency injection
-(`ChatClient` protocol; production-реализация — `OpenAIChatClient`, тонкая обёртка над
-установленным `openai` SDK, `chat.completions.create`). Конструктор сервиса и импорт модуля
-не выполняют сетевых вызовов.
-
-**Источники — из метаданных, не от модели.** `AnswerSource` строится напрямую из
-`RetrievedChunk` (`title`, `final_url`/`source_url`, `document_id`, `chunk_index`,
-`chunk_count`) — модель никогда не генерирует URL или список источников сама; промпт прямо
-запрещает придумывать источники. Источники сохраняют порядок первого появления и
-дедуплицируются по итоговому URL (несколько чанков одной страницы → один источник); это
-document-level источники, не claim-level citations (не привязаны к конкретному предложению
-ответа).
-
-**Conversation-aware retrieval retry.** Для обычного standalone-вопроса сервис сохраняет
-существующий direct retrieval path. Если direct retrieval не дал accepted-контекста
-(`score >= 0.25`) и recent conversation history есть, сервис может сделать **ровно одну**
-bounded contextual retry: сначала с помощью history выводится компактный standalone retrieval
-query (например, resolving alias/ссылку вида `Резак` → `RecursiveCharacterTextSplitter`), затем
-по нему выполняется второй `RetrievalService.search()`. Если rewrite не делает запрос
-текстуально более standalone, сервис все равно использует history для одного history-augmented
-contextual query, чтобы alias/ссылки из текущего диалога не терялись в live path. History
-помогает только сформулировать retrieval query; она не становится documentation context, не
-попадает в `AnswerSource` и не может сама по себе обосновать ответ.
-
-**Fallback без контекста.** Если ни direct retrieval, ни этот один contextual retry не дали
-accepted-контекста, chat model для финального ответа не вызывается вообще — сервис
-детерминированно возвращает `GroundedAnswerResult` с `retrieved_chunk_count=0`, пустым
-`sources` и фиксированным текстом:
-
-```
-В базе знаний не найдено достаточно информации для ответа на этот вопрос.
-```
-
-**Ошибки.** `AnswerRetrievalError` — сбой на этапе `RetrievalService.search()` (embedding/
-query/malformed metadata); `AnswerGenerationError` — сбой chat-клиента **или** пустой/
-whitespace-only ответ модели. Оба наследуются от `AnswerServiceError`; исходное исключение
-сохраняется в `__cause__`, публичное сообщение не содержит ключей/секретов/сырых деталей
-исключения.
-
-**Известное ограничение grounding'а (best-effort, не гарантия).** Grounding в текущем MVP
-обеспечивается только промптом (`_SYSTEM_PROMPT` явно требует closed-book-ответ строго по
-предоставленному контексту и запрещает домысливать) и содержимым retrieved-чанков — отдельной
-верификации фактов нет. Так как генерация — это один свободный (free-form) LLM-вызов без
-structured output, модель иногда может добавить правдоподобную, но не подтверждённую явно в
-контексте деталь из своих pretrained-знаний (это наблюдалось на живой проверке). Детерминированная
-claim-level верификация фактов, structured citations или дополнительный verification pass
-(второй LLM-вызов/critic model) не реализованы и отнесены к будущим версиям.
-
-Задать вопрос по индексу (live, требует реальных OpenAI/Pinecone ключей; строго read-only —
-не выполняет upsert/delete/переиндексацию):
-
-```
-python scripts/ask_docs.py "how do I configure the client?"
-python scripts/ask_docs.py "how do I configure the client?" --top-k 3 --namespace documentation
-```
-
-### PyPI JSON lookup
-
-`src/ai_docs_agent/pypi.py` определяет `PyPILookupService.lookup(package_name) ->
-PyPIPackageInfo`, выполняющий один реальный read-only GET:
-
-```
-GET https://pypi.org/pypi/{package_name}/json
-```
-
-Сервис заранее валидирует package name (буквы/цифры/`-`/`_`/`.` допускаются; пустые,
-URL-like, query/path-injection и другие unsafe значения отклоняются до HTTP-запроса), затем
-делает один `httpx`-запрос с явным timeout и возвращает типизированный результат как минимум с
-полями:
-
-- `package_name` — canonical name, который вернул PyPI;
-- `latest_version`;
-- `summary` (`None`, если отсутствует/`null`);
-- `requires_python` (`None`, если отсутствует/`null`);
-- `pypi_url`;
-- `project_url` (`None`, если у пакета нет отдельного project/home URL).
-
-Поддерживаемые error categories: `invalid_package_name`, `package_not_found`, `timeout`,
-`network_error`, `malformed_response`, `upstream_http_error`. Публичный adapter
-`lookup_pypi_package(...)` в `src/ai_docs_agent/tools.py` — тонкая обёртка над этим сервисом.
-
-CLI для live read-only проверки:
-
-```
-python scripts/pypi_lookup.py httpx
-```
-
-Скрипт печатает стабильное summary с placeholder `not specified` для отсутствующих optional
-полей. Unit-тесты для сервиса/CLI используют только `httpx.MockTransport` и fake-сервисы — без
-реальных сетевых вызовов.
-
-### LangChain tool-calling agent
-
-`src/ai_docs_agent/langchain_agent.py` определяет `LangChainToolCallingAgent`, использующий
-реальный `langchain.agents.create_agent(...)` поверх двух thin tools:
-
-- `documentation_search(question: str)` → grounded answer + sources через существующий
-  `DocumentationAnswerService`;
-- `pypi_lookup(package_name: str)` → typed package metadata через существующий
-  `PyPILookupService`.
-
-Agent сам выбирает один из этих инструментов по natural-language запросу. Tool descriptions и
-system instruction разделяют:
-
-- текущие/последние package metadata вопросы → `pypi_lookup`;
-- технические вопросы по OpenAI/Pinecone/LangChain и индексированной документации →
-  `documentation_search`.
-
-User-facing результат — `LangChainAgentResult`: итоговый текст ответа, `AnswerSource[]`,
-`tools_used`, `tool_call_count`, `used_no_tool`, `outcome` (`success` / `safe_fallback`) и
-безопасная `failure_category`. Для PyPI-ответов источник содержит как минимум реальный PyPI
-URL; для документации сохраняются источники из `GroundedAnswerResult`.
-
-**Bounded execution.** На этом этапе agent ограничен одним model step для выбора tool и одним
-tool step. Пользовательский ответ рендерится напрямую из authoritative tool result, а не из
-второго model pass, поэтому:
-
-- текущая версия пакета не может "тихо" прийти из pretrained knowledge;
-- documentation sources берутся только из tool output;
-- запрос не уходит в loop с повторными tool calls.
-
-**Безопасность tool output.** Tools сериализуют только краткий safe result: answer/status/sources
-для документации и package metadata/status для PyPI. Raw traceback'и, chunk bodies, vectors,
-секреты и upstream response bodies в tool output не попадают.
-
-CLI для live read-only проверки:
-
-```
-python scripts/ask_agent.py "Какая последняя версия пакета httpx на PyPI?"
-python scripts/ask_agent.py "Что такое embeddings в OpenAI API?"
-```
-
-Скрипт печатает итоговый ответ, sources и строку `Tools used: ...`. Exit code `0` означает
-либо полноценный успешный ответ, либо безопасный handled fallback; `1` используется только для
-startup/unhandled orchestration failure.
-
-Unit-тесты для agent/CLI полностью mock-based: используется fake tool-calling chat model и
-fake сервисы, без реальных OpenAI/Pinecone/PyPI/Telegram вызовов. Live CLI checks выполняются
-отдельно вручную и не входят в pytest.
-
-### Conversation memory
-
-`src/ai_docs_agent/memory.py` определяет короткую, **process-local** разговорную память,
-изолированную по `session_id`:
-
-- `InMemoryConversationMemory` — обычный `dict[str, list[ConversationMessage]]` в памяти
-  процесса: хранит **последние 10** сообщений (`user`/`assistant`) на сессию, старые
-  сообщения при превышении лимита отбрасываются первыми (FIFO); `get_history()` возвращает
-  неизменяемый `tuple[ConversationMessage, ...]` (снимок, а не живую ссылку на внутренний
-  список), сессии друг от друга полностью изолированы, `clear(session_id)` удаляет только
-  одну сессию;
-- `ConversationAnswerService` — тонкая обёртка вокруг `DocumentationAnswerService`: читает
-  историю сессии → вызывает `answer(question, history=..., ...)` → **только при успешном
-  результате** добавляет в память нормализованный вопрос и полученный ответ. Если retrieval
-  или генерация упали с ошибкой, память сессии остаётся без изменений; fallback-ответ
-  "нет данных в базе" — успешный результат и тоже сохраняется в историю. Эта же history
-  используется для contextual follow-up retrieval, но не считается documentary evidence.
-
-**Память — process-local и не переживает перезапуск процесса.** Это намеренное ограничение
-MVP для этого этапа домашнего задания: ничего не пишется на диск/в БД/по сети. Персистентное
-хранилище (например, SQLite) — запланированное улучшение v2 (см. "Planned improvements"
-ниже).
-
-**История помогает разрешать ссылки, но не является источником фактов.** История диалога
-подставляется в промпт только чтобы помочь модели понять, к чему относятся слова вида "он"/
-"эта библиотека", и сохранить continuity между репликами. Промпт явно требует не считать
-факт, упомянутый только в истории (а не в retrieved-чанках), подтверждённым документальным
-фактом; retrieved-чанки остаются единственным источником фактов для ответа. История (как и
-retrieved-текст) считается untrusted data и не может переопределить system-инструкции. В
-`AnswerSource`/список источников история никогда не попадает.
-
-Пример использования из Python (без сети — с fake-сервисами; для реального ответа
-`DocumentationAnswerService` должен быть сконфигурирован обычным образом, см. выше):
-
-```python
-from ai_docs_agent.agent import DocumentationAnswerService
-from ai_docs_agent.config import get_settings
-from ai_docs_agent.memory import ConversationAnswerService
-
-answer_service = DocumentationAnswerService(get_settings())
-conversation = ConversationAnswerService(answer_service)
-
-first = conversation.answer("session-123", "What is LangChain?")
-second = conversation.answer("session-123", "How do I configure it?")  # "it" resolved via history
-
-conversation.reset("session-123")  # clears only this session's history
-```
-
-### Long-term user memory (Stage 4H)
-
-`src/ai_docs_agent/user_memory.py` определяет `UserMemoryService` — контролируемую
-персистентную пользовательскую память в Pinecone:
-
-```
-remember(user_identifier, statement) →
-HMAC-SHA256 pseudonymous identity → per-user namespace →
-dedup check (deterministic record ID) → OpenAI embedding → Pinecone upsert
-
-recall(user_identifier, query) →
-та же identity/namespace → OpenAI query embedding →
-Pinecone query только в namespace этого пользователя →
-top_k + score threshold → typed matches, отсортированные по score
-```
-
-**Запись только явная (explicit-write-only).** Память пишется только через явный вызов
-`remember(...)` (или CLI-команду ниже). Обычные сообщения, вопросы и ответы по документации
-**никогда не сохраняются автоматически**. Детерминированный парсер
-`parse_remember_command(text)` распознаёт только осознанную команду вида
-`Запомни: в примерах я предпочитаю httpx.` (также `Remember: ...`; регистронезависимо,
-двоеточие обязательно) и возвращает `None` для любых обычных фраз («Я использую httpx.»,
-«Расскажи про httpx.» и т.п.). Парсер отделён от Pinecone-персистентности: он только
-извлекает текст, а решение о записи принимает вызывающий код через `remember(...)`.
-
-**Псевдонимная identity (HMAC).** Raw-идентификатор пользователя (например, Telegram chat
-ID) никогда не сохраняется в Pinecone (ни в записи, ни в метаданных, ни в ID), не пишется в
-логи и не возвращается в результатах. Identity выводится как
-`HMAC-SHA256(USER_MEMORY_HASH_SECRET, raw_identifier)` — не простой unsalted hash.
-`USER_MEMORY_HASH_SECRET` — обязательный отдельный секрет (`SecretStr`); он не derived из
-`TELEGRAM_BOT_TOKEN`/`OPENAI_API_KEY`/`PINECONE_API_KEY`, поэтому ротация любого из этих
-токенов не меняет memory identity. **Ротация самого `USER_MEMORY_HASH_SECRET` меняет все
-derived namespaces: ранее записанная память становится недостижимой через новую identity**
-(старые записи остаются в старых namespaces, но больше никогда не запрашиваются).
-
-**Один namespace на пользователя.** Namespace = `user-memory-<первые 32 hex-символа
-digest>` (`USER_MEMORY_NAMESPACE_PREFIX` настраивается; длина ограничена; для одного
-идентификатора и секрета — детерминирован; raw-идентификатор из namespace не
-восстанавливается). Каждый remember/recall всегда явно указывает derived namespace этого
-пользователя; documentation namespace никогда не читается и не изменяется memory-сервисом
-(prefix обязан отличаться от `PINECONE_DOCUMENTS_NAMESPACE` — проверяется на границе
-конфигурации). В логи попадает только сокращённый digest (12 символов), не raw ID и не
-полный digest.
-
-**Дедупликация / content hash.** Content hash = SHA-256 от нормализованной формы statement
-(Unicode NFC → casefold → схлопывание пробельных последовательностей → strip). Record ID
-детерминирован: `memory-<первые 32 hex-символа content hash>`. Повторный remember того же
-нормализованного текста адресует ту же запись, не создаёт дубликата и возвращает typed
-статус `duplicate` (первая запись — `created`); дедупликация проверяется fetch'ем по ID
-**до** создания embedding (повторный remember не тратит embedding-вызов). Одинаковый текст
-у разных пользователей остаётся изолированным в разных namespaces. Human-readable текст
-сохраняется как есть (только strip краёв), нормализация используется только для
-валидации/хеширования. Model-based semantic dedup на этом этапе сознательно не выполняется.
-
-**Валидация statement.** До embedding/записи отклоняются: пустой/whitespace-only текст,
-текст только из command prefix, control-символы (кроме `\t`/`\n`/`\r`), текст длиннее
-`USER_MEMORY_MAX_STATEMENT_LENGTH` (по умолчанию 500 символов). Unicode/русский текст
-сохраняется без искажения.
-
-**Recall.** Запрос embed'ится ровно один раз и выполняется только в namespace этого
-пользователя с фильтром `{"kind": {"$eq": "user_memory"}}`, `top_k =
-USER_MEMORY_TOP_K` (по умолчанию 5) и порогом `USER_MEMORY_SCORE_THRESHOLD` (по умолчанию
-0.35 — значение нужно валидировать под выбранную embedding-модель и metric индекса;
-текущая конфигурация — `text-embedding-3-small` + cosine). Кандидаты ниже порога
-отбрасываются; результат — `UserMemoryRecallResult` с matches, отсортированными по score,
-и безопасным пустым состоянием (`found=false`), если ничего не прошло порог. Другой
-пользователь тот же факт не получает — его namespace другой.
-
-**Метаданные записи** — плоские, без вложенных объектов: `kind`, `text`, `content_hash`,
-`schema_version`, `created_at` (UTC ISO-8601). Не сохраняются: raw user ID, chat ID,
-username, телефон, API-ключи, транскрипт диалога, ответы ассистента, document chunks.
-
-**Ошибки** — typed: `InvalidUserIdentifierError`, `InvalidMemoryStatementError`,
-`MemoryIdentityConfigurationError`, `MemoryEmbeddingError`, `MemoryStorageError`,
-`MemoryRecallError`, `MalformedMemoryRecordError` (все наследуют `UserMemoryError`).
-
-**Privacy-safe observability.** Логи содержат только: короткий identity digest, операцию
-(remember/recall), длину statement/query, статус created/duplicate, raw/accepted counts,
-top scores, elapsed time и безопасную категорию сбоя. Никогда не логируются: raw user ID,
-текст statement/query/памяти, embeddings, ключи, `USER_MEMORY_HASH_SECRET`, полный digest.
-
-**Интеграция с Telegram/агентом (Stage 4I) реализована.** В Telegram явная команда
-`Запомни: ...` детерминированно (до вызова агента и без участия модели) записывает
-предпочтение через `UserMemoryService.remember`, а вопросы вида «Какую HTTP-библиотеку я
-предпочитаю?» агент решает сам через tool `user_memory_recall` (см. ниже). Обычная
-переписка в Telegram по-прежнему **никогда** не сохраняется в векторную память. Команда
-`/reset` очищает только короткую process-local разговорную память и **не удаляет**
-долговременную память.
-
-CLI (live, требует реальных OpenAI/Pinecone ключей и `USER_MEMORY_HASH_SECRET`):
-
-```
-python scripts/user_memory.py remember stage4h-demo-user "В примерах я предпочитаю httpx."
-python scripts/user_memory.py recall stage4h-demo-user "Какую HTTP-библиотеку я предпочитаю?"
-```
-
-Exit codes: `0` — успешная запись, `duplicate` или безопасный пустой recall; `1` —
-невалидная конфигурация/ввод или инфраструктурный сбой (без traceback для ожидаемых
-domain-ошибок). CLI не печатает raw namespace, полный digest и секреты.
-
-### Integrated flow (Stage 4I): Telegram → agent + память
-
-`src/ai_docs_agent/integrated_agent.py` определяет `IntegratedConversationAgentService` —
-минимальный интегрирующий сервис поверх уже существующих компонентов (ничего не
-переписано, переиспользуются готовые contracts и DI-швы):
-
-```
-TelegramBotService
-→ IntegratedConversationAgentService
-   ├─ детерминированный parse_remember_command:
-   │  "Запомни: ..." → UserMemoryService.remember (агент НЕ вызывается)
-   └─ остальное → LangChainToolCallingAgent (autonomous tool calling):
-      - documentation_search (получает short-term history через trusted
-        request-scoped adapter → contextual retrieval работает как раньше)
-      - pypi_lookup
-      - user_memory_recall (request-scoped: identity привязан вне схемы tool)
-→ InMemoryConversationMemory (короткая память по session_id)
-```
-
-**Три инструмента агента.** Выбор инструмента — полностью autonomous LangChain tool
-calling (никакого regex/keyword-роутинга для обычных вопросов). Единственный
-детерминированный pre-routing — распознавание явной команды `Запомни: ...`, потому что
-решение о персистентной записи нельзя делегировать модели.
-
-**Request-scoped user_memory_recall.** Model-visible схема tool'а содержит только
-семантический `query`. Доверенный `session_id` (raw Telegram chat ID) привязывается
-application-кодом через request-scoped context (`ContextVar`) — модель никогда не
-получает и не может сгенерировать user ID или namespace; HMAC-namespace выводится внутри
-`UserMemoryService`. Найденное предпочтение возвращается как text+score без raw ID,
-namespace, векторов и внутренних metadata.
-
-**Память ≠ документация.** Восстановленное предпочтение — пользовательские данные, а не
-документация: оно не получает поддельный `AnswerSource`, а в Telegram помечается
-отдельной подписью `Источник: ваше сохранённое предпочтение (персональная память)`.
-
-**Out-of-scope policy.** Бот не отвечает на произвольные вопросы из pretrained knowledge
-(например, «Как сварить борщ?»): если агент ответил без вызова инструмента, интегрированный
-сервис детерминированно заменяет такой ответ безопасным fallback'ом без источников
-(`failure_category="out_of_scope_no_tool"`). No-tool ответ модели не может обойти политику.
-
-**Явная запись памяти.** Для `Запомни: в примерах я предпочитаю httpx.` сервис: распознаёт
-команду детерминированно → вызывает `remember` ровно один раз → не вызывает агента →
-возвращает краткое подтверждение для `created`/`duplicate` → record ID / namespace /
-identity digest пользователю никогда не показываются. Фразы «Я предпочитаю httpx.»,
-«Мне нравится requests.», «Расскажи про httpx.» память **не** записывают.
-
-**Typed result.** `IntegratedAgentResult`: `answer`, `sources` (существующий
-`AnswerSource`), `tools_used`, `tool_call_count`, `used_no_tool`, `outcome`,
-`failure_category`, `remember_command_detected`, `memory_written`, `memory_write_status`.
-
-**Privacy-safe логирование.** На каждый запрос: session hash, длина вопроса,
-`remember_command=true/false`, выбранный tool, tool_call_count, `created`/`duplicate`,
-число источников, elapsed, безопасная категория сбоя. Никогда не логируются: текст
-вопроса/statement/восстановленного предпочтения, raw chat ID, полный namespace, секреты,
-векторы, chunk bodies, chain-of-thought.
-
-### Telegram bot
-
-`src/ai_docs_agent/telegram_bot.py` — Telegram-граница поверх
-`IntegratedConversationAgentService`, на библиотеке
-[`python-telegram-bot`](https://python-telegram-bot.org/):
-
-```
-Telegram-сообщение → str(chat_id) как session_id →
-IntegratedConversationAgentService.handle_message(session_id, text) →
-IntegratedAgentResult → детерминированный текст с ответом и источниками → Telegram-ответ
-```
-
-**Команды и обычные сообщения:**
-
-- `/start` — приветствие: бот отвечает по индексированной документации, умеет узнавать
-  актуальные данные пакета на PyPI, `Запомни: ...` явно сохраняет личное предпочтение
-  (обычные сообщения никогда не сохраняются), помнит до 10 последних сообщений текущего
-  диалога, `/reset` очищает контекст диалога, но не удаляет сохранённые предпочтения;
-- `/reset` — вызывает `IntegratedConversationAgentService.reset(str(chat_id))` (очищается
-  только короткая память этой сессии) и отвечает, что контекст диалога очищен, а явно
-  сохранённые предпочтения не удалены. После `/reset` alias/continuity context недоступен,
-  но долговременная память по-прежнему recall'ится;
-- `Запомни: <текст>` — явная запись долговременного предпочтения (см. выше);
-- обычный текст — через LangChain agent: документация / PyPI / recall предпочтений.
-  Пользовательские `top_k`/namespace/фильтры и URL indexing через чат недоступны. Бот
-  всегда использует `PINECONE_DOCUMENTS_NAMESPACE` для документации.
-
-**Изоляция по чатам.** `session_id = str(chat_id)` — разные чаты полностью изолированы друг
-от друга и в короткой, и в долговременной памяти (HMAC-namespace на пользователя); `/reset`
-очищает только текущий чат. В короткую память попадают только текст вопроса и текст ответа —
-объекты Telegram-сообщений, username/имя/телефон и источники/чанки никогда не сохраняются.
-
-**Форматирование ответа** (plain text, без Markdown/HTML-экранирования):
-
-```
-<ответ>
-
-Источники:
-1. <title> — <url>
-2. ...
-```
-
-Без источников — `Источники: не найдены`. Источники строятся только из
-`GroundedAnswerResult.sources` (те же метаданные, что и в `ask_docs.py`), а не парсятся из
-текста ответа модели.
-
-**Разбиение длинных сообщений.** `split_telegram_message()` — небольшой детерминированный
-helper: делит текст на части по ≤4000 символов, предпочитая границу по `\n`, сохраняет порядок
-и не теряет ни одного символа (склейка частей равна исходному тексту), каждая часть непустая.
-
-**Ошибки.** `AnswerRetrievalError`/`AnswerGenerationError` (и любой другой `AnswerServiceError`)
-приводят к единому сообщению `Не удалось подготовить ответ. Попробуйте повторить запрос
-позже.` — без traceback'а, деталей исключения, ключей или namespace. Сбой самой отправки в
-Telegram (сетевая ошибка и т.п.) перехватывается на границе обработчика и не приводит к
-падению бота.
-
-**Operational logging.** Live entry point пишет один безопасный startup `INFO`-лог с
-`PINECONE_INDEX_NAME`, `PINECONE_DOCUMENTS_NAMESPACE`, embedding model, `RETRIEVAL_TOP_K` и
-score threshold (`0.25`), а для обычных вопросов — privacy-safe request/retrieval diagnostics:
-короткий стабильный hash от `chat_id`, длину вопроса, raw/accepted candidate counts, top scores,
-результат (`grounded` или `no_context`) и elapsed time. Текст вопроса, raw `chat_id`,
-токен Telegram, API keys, векторы и полные chunk bodies в эти логи не попадают.
-
-**Остановка.** Нормальное завершение polling (включая `Ctrl+C`) логируется как один краткий
-`INFO`-лог `Telegram bot stopped`; genuine startup/runtime failures по-прежнему завершаются
-с error exit code и безопасным сообщением в консоль.
-
-Запуск бота (live, требует реальных `TELEGRAM_BOT_TOKEN`/OpenAI/Pinecone ключей; блокирует
-процесс long polling'ом до `Ctrl+C`):
-
-```
-python scripts/run_telegram_bot.py
-```
-
-### Typed configuration
-
-`src/ai_docs_agent/config.py` определяет `AppSettings` (pydantic-settings): загружает
-переменные окружения (и опционально `.env`), не выполняет сетевых обращений при импорте,
-хранит API-ключи как `SecretStr` (не раскрываются через `repr`/`str`), игнорирует неизвестные
-переменные и валидирует значения (dimension > 0, timeout > 0, poll interval > 0 и не больше
-timeout, непустые имена индекса/модели, метрика пока только `cosine`). Используйте
-`get_settings()` — кэшированную фабрику настроек.
-
-### Pinecone integration smoke-test
-
-`src/ai_docs_agent/pinecone_store.py` определяет `PineconeStore`:
-
-- `ensure_index()` — проверяет существование индекса, при необходимости создаёт
-  serverless-индекс (см. `PINECONE_CREATE_IF_MISSING` ниже) и проверяет, что dimension и
-  metric существующего индекса совпадают с конфигурацией;
-- `smoke_test()` — создаёт embedding для фиксированного тестового текста, upsert’ит один
-  вектор в отдельный namespace, ждёт (bounded polling) появления результата в query,
-  проверяет совпадение ID и в `finally` всегда пытается удалить тестовый вектор.
-
-#### `PINECONE_CREATE_IF_MISSING`
-
-Если `false` (по умолчанию) и индекс с именем `PINECONE_INDEX_NAME` не существует —
-`ensure_index()` выбрасывает `PineconeIndexNotFoundError` (без раскрытия ключей). Если
-`true` — индекс будет создан как serverless-индекс с настроенными dimension/metric/cloud/
-region. Существующий индекс никогда не пересоздаётся автоматически.
-
-Пустой `OPENAI_BASE_URL` (или строка из пробелов) нормализуется в `None` на границе
-конфигурации — это означает использование стандартного OpenAI endpoint, а не пустой URL.
-
-`TELEGRAM_BOT_TOKEN` обязателен и не должен быть пустым для реального запуска бота
-(`scripts/run_telegram_bot.py`); хранится как `SecretStr` и никогда не появляется в
-error-сообщениях, логах, `repr()` или примерах в этом README.
-
-### Unit tests vs. live smoke-test
-
-- `pytest` (`tests/test_config.py`, `tests/test_models.py`, `tests/test_pinecone_store.py`,
-  `tests/test_pinecone_smoke_script.py`, `tests/test_url_ingestion.py`,
-  `tests/test_url_preview_script.py`, `tests/test_indexing.py`,
-  `tests/test_index_url_script.py`, `tests/test_retrieval.py`,
-  `tests/test_search_query_script.py`, `tests/test_agent.py`,
-  `tests/test_ask_docs_script.py`, `tests/test_memory.py`, `tests/test_telegram_bot.py`,
-  `tests/test_run_telegram_bot_script.py`) — быстрые unit-тесты на fake-объектах, без сети,
-  без реального DNS, без реальных ключей, без реальных задержек, без long polling'а.
-  HTTP fake'ается через `httpx.MockTransport`, DNS — через injectable resolver, Pinecone/
-  OpenAI — через dependency-injection-friendly fakes (`DocumentIndexingService`,
-  `RetrievalService`, `DocumentationAnswerService` и `PineconeStore` принимают
-  fake-сервисы/клиенты и injectable clock/sleep; `ConversationAnswerService` принимает
-  fake `DocumentationAnswerService`). `InMemoryConversationMemory` не требует fake'ов —
-  это обычный in-process dict без внешних зависимостей. `TelegramBotService` тестируется
-  через fake-объекты `Update`/`Message`/`Chat`/`Bot` (без реального Telegram API).
-- `scripts/pinecone_smoke_test.py` — **live**-скрипт, выполняющий реальные вызовы OpenAI и
-  Pinecone. Требует настоящих `OPENAI_API_KEY` и `PINECONE_API_KEY` и создаёт/удаляет один
-  реальный вектор в Pinecone. Не запускается автоматически и не входит в тестовый набор.
-  Считается полностью успешным (exit code `0`, `Pinecone smoke test OK`) только если
-  удаление тестового вектора тоже прошло успешно; если pipeline прошёл, но cleanup не
-  удался, скрипт печатает `Pinecone smoke test FAILED: cleanup did not complete` и
-  возвращает exit code `2` (домен/выполнение — `1`).
-- `scripts/url_preview.py` — выполняет реальный HTTP-запрос к переданному URL (но не
-  OpenAI/Pinecone) — тоже не входит в автоматический тестовый набор; тестируется только его
-  чистая функция форматирования и `main()` с внедрённым fake-сервисом.
-- `scripts/index_url.py` — **live**-скрипт, выполняющий реальный HTTP-запрос к URL и реальные
-  вызовы OpenAI/Pinecone (embeddings + upsert + verification + cleanup). Требует настоящих
-  ключей, не входит в автоматический тестовый набор; тестируется только чистая функция
-  форматирования (`format_index_report`) и `main()` с внедрённым fake-сервисом. Exit codes:
-  `0` — indexing + verification + запрошенный cleanup успешны; `2` — indexing и verification
-  успешны, но cleanup не удался; `1` — домен/выполнение (включая ошибки URL ingestion).
-- `scripts/search_query.py` — **live**-скрипт, выполняющий реальные вызовы OpenAI (query
-  embedding) и Pinecone (query). Строго read-only: никогда не выполняет upsert/delete/
-  переиндексацию. Требует настоящих ключей, не входит в автоматический тестовый набор;
-  тестируется только чистая функция форматирования (`format_search_report`) и `main()` с
-  внедрённым fake-сервисом. Exit codes: `0` — поиск успешен (в т.ч. с пустым результатом);
-  `1` — домен/выполнение.
-- `scripts/ask_docs.py` — **live**-скрипт, выполняющий реальные вызовы OpenAI (query
-  embedding + chat completion) и Pinecone (query). Строго read-only: никогда не выполняет
-  upsert/delete/переиндексацию. Требует настоящих ключей, не входит в автоматический
-  тестовый набор; тестируется только чистая функция форматирования (`format_answer_report`)
-  и `main()` с внедрённым fake-сервисом. Exit code `0` — ответ получен успешно (в т.ч.
-  fallback без контекста); `1` — домен/выполнение.
-- `scripts/ask_agent.py` — **live**-скрипт нового LangChain tool-calling layer: выполняет
-  реальные read-only вызовы OpenAI/Pinecone и, когда agent выбирает PyPI tool, один реальный
-  read-only GET к PyPI JSON API. Не выполняет index/delete/mutate операций. Тестируется через
-  `main(service=fake_service)` и pure formatting function `format_agent_report`; unit-тесты
-  используют только fake tool-calling model и fake сервисы. Exit code `0` — success или safe
-  fallback; `1` — startup/unhandled orchestration failure.
-- `scripts/pypi_lookup.py` — **live**-скрипт, выполняющий один реальный read-only GET к
-  PyPI JSON API (`/pypi/{package_name}/json`). Не требует OpenAI/Pinecone/Telegram ключей и не
-  изменяет внешнее состояние. Тестируется только через `main(service=fake_service)` и pure
-  formatting function `format_pypi_report`; unit-тесты используют только mocks/fakes. Exit code
-  `0` — lookup успешен; `1` — invalid input, package not found, network/upstream или malformed
-  response.
-- `scripts/user_memory.py` — **live**-скрипт долговременной памяти: выполняет реальные
-  вызовы OpenAI (embedding) и Pinecone (fetch/upsert/query) только в derived
-  per-user namespace. Требует настоящих ключей и `USER_MEMORY_HASH_SECRET`, не входит в
-  автоматический тестовый набор; unit-тесты используют только внедрённый fake-сервис
-  (`main(argv, service=fake)`) и чистые функции форматирования. Exit codes: `0` —
-  успешная запись/`duplicate`/безопасный пустой recall; `1` — невалидный ввод/конфигурация
-  или инфраструктурный сбой.
-- `scripts/run_telegram_bot.py` — **live**-скрипт: строит Telegram `Application`
-  (`build_application()`) и запускает long polling (`Application.run_polling()`), блокируя
-  процесс до остановки. Требует настоящих `TELEGRAM_BOT_TOKEN`/OpenAI/Pinecone ключей, не
-  входит в автоматический тестовый набор; тестируется через внедрённую fake-фабрику
-  приложения (`main(application_factory=...)`), без реального Telegram/OpenAI/Pinecone.
-  На старте пишет безопасный runtime summary в standard-library logging, а при штатной
-  остановке (включая `Ctrl+C`) — один `INFO`-лог `Telegram bot stopped`. Exit code `0` —
-  polling запущен и штатно завершился; `1` — ошибка конфигурации или запуска (сообщение не
-  содержит токен/секреты).
-
-## Требования
-
-- Python >= 3.11
-
-## Создание и активация виртуального окружения (Windows)
-
-```
+| Module (`src/ai_docs_agent/`) | Responsibility |
+| --- | --- |
+| `url_ingestion.py` | URL/DNS validation, bounded fetch, HTML extraction, chunking |
+| `indexing.py`, `pinecone_store.py` | Embeddings, batched upsert, verification, stale-version cleanup |
+| `retrieval.py`, `agent.py` | Filtered semantic search; grounded answer generation with fallback |
+| `langchain_agent.py` | Tool-calling agent (LangChain `create_agent`) with the one-call guard |
+| `user_memory.py` | Explicit-write long-term memory: command parser, HMAC identity, dedup, recall |
+| `integrated_agent.py` | The production conversation service: remember pre-routing, agent, short-term history |
+| `telegram_bot.py` | Private-chat handlers over the integrated service; message splitting |
+| `memory.py` | Short-term, process-local per-chat history (last 10 messages) |
+| `pypi.py`, `config.py`, `observability.py` | PyPI JSON lookup; typed settings; privacy-safe logging helpers |
+
+## Core capabilities
+
+- **Ingest** a documentation page: fetch → extract text (code blocks keep their indentation) →
+  chunk → embed → upsert → verify → clean up stale versions. Operator CLI only.
+- **Retrieve** with a typed, read-only search restricted to `kind == "documentation_chunk"`.
+- **Answer** from retrieved chunks. One bounded contextual retry is made when the direct query
+  finds nothing and the chat has history (for example, resolving an alias the user defined
+  earlier in the same dialogue).
+- **Look up PyPI** package metadata (latest version, summary, `requires_python`, links) over
+  the PyPI JSON API.
+- **Remember** an explicit user preference (`Запомни: …` or `Remember: …`) and **recall** it
+  later when the user asks about it.
+- **Converse over Telegram** in private chats: `/start`, `/reset`, and free-text questions.
+  The bot's own messages and fallbacks are in Russian.
+
+## Safety and trust boundaries
+
+**Ingestion (SSRF boundary).** Ingestion is operator-only and applies these checks:
+
+- only `http`/`https`; URLs with embedded credentials are rejected;
+- `localhost` and `*.localhost` are rejected, with hostnames normalized (case, trailing dots);
+- every DNS answer for the host must be a globally routable address, so loopback, private,
+  link-local (including cloud metadata addresses), CGNAT, multicast and reserved ranges are
+  rejected; IPv4-mapped IPv6 is judged by the embedded IPv4 address;
+- redirects are followed manually (up to `URL_MAX_REDIRECTS`) and each hop goes through the
+  full URL/DNS validation again;
+- response size is bounded by `Content-Length` and by the bytes actually streamed, and only
+  `text/html` / `application/xhtml+xml` bodies are accepted.
+
+This is best-effort protection, not a guarantee: DNS is resolved once for validation and again
+by the HTTP client when it connects, so a DNS-rebinding race between the two (TOCTOU) is
+possible. Where that matters, add network egress restrictions around the ingestion host.
+
+**Grounded answers.** What the code guarantees, and what it does not:
+
+| Guaranteed by code | Not guaranteed |
+| --- | --- |
+| Search is filtered by documentation `kind`; chunks scoring below `RETRIEVAL_SCORE_THRESHOLD` (default `0.25`) are dropped | The threshold is not calibrated to a particular corpus |
+| No chunk passes the threshold ⇒ fixed fallback (Russian: "В базе знаний не найдено достаточно информации…") and no answer is generated | Passing the threshold means "similar enough", not "answers the question" |
+| Source titles/URLs are built from chunk metadata and de-duplicated by URL | Sources are document-level, not claim-level citations |
+| The prompt tells the model to answer only from the retrieved context and to treat chunks and history as untrusted data | The answer text is model-generated and is **not** verified claim by claim; the model can still add an unsupported detail |
+
+**Agent boundary.** The Telegram runtime exposes three read-only tools: `documentation_search`,
+`pypi_lookup` and `user_memory_recall`. At most one tool runs per request: parallel tool calls
+are disabled at the provider and, if a response still contains several, the whole step is
+discarded and a fixed fallback is returned without running any of them. The tool result is
+rendered directly, with no second model pass, so package versions and source URLs cannot be
+rewritten by the model. No tool fetches arbitrary URLs, writes memory or touches the index. In
+the Telegram flow, a model reply produced without any tool call is replaced by the fixed
+no-context fallback, so the bot does not answer from the model's general knowledge.
+
+**Telegram boundary.** Only new messages in **private chats** are handled; group, supergroup
+and channel updates and edited messages are ignored. Each chat is isolated by `str(chat_id)`.
+Users cannot choose namespaces, `top_k`, models or filters.
+
+**Memory.** Long-term memory is written only by the deterministic `Запомни:` / `Remember:`
+command, never by the model and never from ordinary messages. The raw chat ID is never stored;
+each chat gets a Pinecone namespace derived from `HMAC-SHA256(USER_MEMORY_HASH_SECRET, chat_id)`.
+Recalled memory is labeled as personal memory, not presented as documentation. `/reset` clears
+only the short-term context; saved preferences stay. The agent has no memory-write tool.
+
+**Logging.** Request logs carry a 12-character keyed session hash, lengths, tool names, counts
+and outcome categories. Question text, memory text, raw chat IDs, namespaces and secrets are not
+logged. `USER_MEMORY_HASH_SECRET` also keys the session hash, using a domain-separated HMAC
+input, so the same secret protects both memory identity and log identifiers.
+
+## Quick start
+
+Requires **Python ≥ 3.11**.
+
+POSIX shell:
+
+```bash
+git clone https://github.com/eliv1982/ai-docs-rag-agent.git
+cd ai-docs-rag-agent
 python -m venv .venv
-.venv\Scripts\activate
-```
-
-## Установка проекта (editable, с dev-зависимостями)
-
-```
+source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-## Переменные окружения
+Windows PowerShell:
 
-Скопируйте `.env.example` в `.env` и заполните реальные значения (API-ключи и Telegram
-token) локально:
-
-```
-copy .env.example .env
-```
-
-**`.env` не должен попадать в Git** — файл уже входит в `.gitignore`; не коммитьте его и не
-вставляйте реальные ключи в issues, PR или документацию.
-
-## Тесты (unit, без сети)
-
-```
-pytest
+```powershell
+git clone https://github.com/eliv1982/ai-docs-rag-agent.git
+cd ai-docs-rag-agent
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
 ```
 
-## Линтинг (Ruff)
+Verify offline (no network, no keys):
 
-```
+```bash
+python -m pip check
 ruff check src tests scripts
+pytest -q
 ```
 
-## Version smoke test
+Then try the [keyless demos](#keyless-demos). Configure live integrations only when you want
+to index documentation or run the bot.
 
-```
-python scripts/smoke_test.py
-```
+## Keyless demos
 
-## Pinecone integration smoke test (live, требует реальных ключей)
+These need **no OpenAI, Pinecone or Telegram credentials** and no `.env` file.
 
-```
-python scripts/pinecone_smoke_test.py
-```
-
-## URL ingestion preview (live HTTP-запрос к переданному URL, без OpenAI/Pinecone)
-
-```
-python scripts/url_preview.py "https://example.com/docs"
-```
-
-## URL indexing в Pinecone (live, требует реальных OpenAI/Pinecone ключей)
-
-```
-python scripts/index_url.py "https://example.com/docs"
-python scripts/index_url.py "https://example.com/docs" --namespace documentation
-```
-
-## Semantic search / retrieval (live, read-only, требует реальных OpenAI/Pinecone ключей)
-
-```
-python scripts/search_query.py "how do I configure the client?"
-python scripts/search_query.py "how do I configure the client?" --top-k 3 --namespace documentation
-```
-
-## Grounded RAG answering (live, read-only, требует реальных OpenAI/Pinecone ключей)
-
-```
-python scripts/ask_docs.py "how do I configure the client?"
-python scripts/ask_docs.py "how do I configure the client?" --top-k 3 --namespace documentation
-```
-
-## PyPI package lookup (live, read-only, без OpenAI/Pinecone)
-
-```
+```bash
+# PyPI lookup — one read-only request to the PyPI JSON API (needs internet)
 python scripts/pypi_lookup.py httpx
+
+# URL preview — fetch, extract and chunk one page without embedding or storing anything
+# (needs internet; use any public documentation page)
+python scripts/url_preview.py "https://developers.openai.com/api/docs/guides/embeddings"
 ```
 
-## LangChain tool-calling agent CLI (live, read-only)
+The safety checks can be seen without any network traffic, because these are rejected before a
+request is made:
 
-```
-python scripts/ask_agent.py "Какая последняя версия пакета httpx на PyPI?"
-python scripts/ask_agent.py "Что такое embeddings в OpenAI API?"
-```
-
-## Long-term user memory CLI (live, требует реальных OpenAI/Pinecone ключей и USER_MEMORY_HASH_SECRET)
-
-```
-python scripts/user_memory.py remember stage4h-demo-user "В примерах я предпочитаю httpx."
-python scripts/user_memory.py recall stage4h-demo-user "Какую HTTP-библиотеку я предпочитаю?"
+```bash
+python scripts/url_preview.py http://127.0.0.1/                       # disallowed address
+python scripts/url_preview.py http://169.254.169.254/latest/meta-data/ # link-local metadata IP
+python scripts/url_preview.py file:///etc/passwd                      # unsupported scheme
+python scripts/pypi_lookup.py "../etc"                                # invalid package name
 ```
 
-Запись выполняется только этой явной операцией; обычные вопросы/диалог ничего не сохраняют.
+`python scripts/pinecone_smoke_test.py` is **not** keyless: it creates an embedding and writes
+and deletes a test vector, so it needs OpenAI and Pinecone configuration.
 
-## Telegram bot (live, требует реальных TELEGRAM_BOT_TOKEN/OpenAI/Pinecone ключей)
+## Live configuration
 
-Запускает long polling и блокирует процесс до `Ctrl+C`:
+Copy the template and fill in your own values; `.env` is git-ignored and must never be committed.
 
+```bash
+cp .env.example .env              # PowerShell: Copy-Item .env.example .env
 ```
+
+Each command validates only the settings it uses, and error messages name the variable but never
+print its value. Pinecone's index must already exist with a matching dimension (1536 for the
+default embedding model) and `cosine` metric, or set `PINECONE_CREATE_IF_MISSING=true` to have a
+serverless index created.
+
+| Command | Required variables |
+| --- | --- |
+| `url_preview.py`, `pypi_lookup.py`, `smoke_test.py` | none |
+| `pinecone_smoke_test.py`, `index_url.py`, `search_query.py` | `OPENAI_API_KEY`, `PINECONE_API_KEY` |
+| `ask_docs.py`, `ask_agent.py` | the above + `OPENAI_CHAT_MODEL` |
+| `user_memory.py` | `OPENAI_API_KEY`, `PINECONE_API_KEY`, `USER_MEMORY_HASH_SECRET` |
+| `run_telegram_bot.py` | all of the above + `TELEGRAM_BOT_TOKEN` |
+
+| Group | Variable | Default | Notes |
+| --- | --- | --- | --- |
+| OpenAI | `OPENAI_API_KEY` | — | Secret. Needed wherever embeddings or chat are used. |
+| | `OPENAI_CHAT_MODEL` | — (`.env.example`: `gpt-4o-mini`) | Required for answering, the agent and the bot. |
+| | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Must match the index dimension. |
+| | `OPENAI_BASE_URL` | unset | Optional endpoint override; blank means the default. |
+| | `OPENAI_TIMEOUT_SECONDS` | `60` | Per-request timeout for every OpenAI client; must be > 0. |
+| Pinecone | `PINECONE_API_KEY` | — | Secret. |
+| | `PINECONE_INDEX_NAME` | `ai-docs-rag-agent` | |
+| | `PINECONE_DOCUMENTS_NAMESPACE` | `documentation` | Namespace for indexed documentation. |
+| | `PINECONE_CREATE_IF_MISSING` | `false` | When `true`, creates a serverless index using the next four settings. |
+| | `PINECONE_CLOUD` / `PINECONE_REGION` | `aws` / `us-east-1` | Used only when creating an index. |
+| | `PINECONE_DIMENSION` / `PINECONE_METRIC` | `1536` / `cosine` | Only `cosine` is supported. |
+| | `PINECONE_SMOKE_*` | see `.env.example` | Namespace and timing for the live smoke test. |
+| Retrieval | `RETRIEVAL_TOP_K` | `5` | 1–50. |
+| | `RETRIEVAL_SCORE_THRESHOLD` | `0.25` | 0.0–1.0 cosine relevance gate for documentation; not re-calibrated. |
+| URL fetch | `URL_FETCH_TIMEOUT_SECONDS` | `15` | |
+| | `URL_MAX_RESPONSE_BYTES` | `2000000` | Hard cap on the response body. |
+| | `URL_MAX_REDIRECTS` | `5` | 0–10; each hop is re-validated. |
+| | `URL_MIN_TEXT_CHARS` | `200` | Pages with less extracted text are rejected. |
+| | `URL_USER_AGENT` | `ai-docs-rag-agent/0.1` | |
+| | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1200` / `200` | Overlap must be smaller than the chunk size. |
+| Indexing | `EMBEDDING_BATCH_SIZE`, `PINECONE_UPSERT_BATCH_SIZE`, `PINECONE_FETCH_BATCH_SIZE` | `64`, `100`, `500` | Fetch batch ≤ 1000. |
+| | `PINECONE_INDEX_VERIFY_TIMEOUT_SECONDS`, `PINECONE_INDEX_VERIFY_POLL_INTERVAL_SECONDS` | `30`, `1` | Bounded post-write verification. |
+| | `PINECONE_REPLACE_OLD_SOURCE_VERSIONS` | `true` | Delete stale versions of the same page after a verified write. |
+| PyPI | `PYPI_BASE_URL`, `PYPI_TIMEOUT_SECONDS` | `https://pypi.org`, `10` | No credentials needed. |
+| Telegram | `TELEGRAM_BOT_TOKEN` | — | Secret. Required only for the bot. |
+| User memory | `USER_MEMORY_HASH_SECRET` | — | Secret; use a long random value, not a reused key. Derives per-chat memory namespaces **and** keys the session hashes in logs. Rotating it orphans existing memory and changes log identifiers. |
+| | `USER_MEMORY_NAMESPACE_PREFIX` | `user-memory` | Must differ from the documentation namespace. |
+| | `USER_MEMORY_TOP_K` / `USER_MEMORY_SCORE_THRESHOLD` | `5` / `0.35` | Recall limit and cosine threshold (not re-calibrated). |
+| | `USER_MEMORY_MAX_STATEMENT_LENGTH` | `500` | 1–4000 characters. |
+
+## Usage
+
+```bash
+# 1. Index documentation (operator; needs OpenAI + Pinecone)
+python scripts/index_url.py "https://developers.openai.com/api/docs/guides/embeddings"
+
+# 2. Inspect retrieval, then ask a grounded question (read-only)
+python scripts/search_query.py "what are embeddings?" --top-k 3
+python scripts/ask_docs.py "what are embeddings?"
+
+# 3. Ask the tool-calling agent (documentation + PyPI; the CLI agent has no memory tool)
+python scripts/ask_agent.py "What is the latest version of httpx on PyPI?"
+
+# 4. Run the Telegram bot (long polling; Ctrl+C to stop)
 python scripts/run_telegram_bot.py
+
+# Optional: explicit long-term memory from the command line
+python scripts/user_memory.py remember demo-user "In examples I prefer httpx."
+python scripts/user_memory.py recall demo-user "Which HTTP library do I prefer?"
 ```
 
-На старте в логи попадает безопасное summary текущего retrieval/runtime-конфига; при
-`Ctrl+C` бот завершает polling, выполняет обычный cleanup и пишет один `INFO`-лог
-`Telegram bot stopped`.
+`index_url.py` exits `0` on success, `2` if the page was indexed and verified but stale-version
+cleanup failed, and `1` on any other error.
 
-## Planned improvements / Следующая версия
+In Telegram (private chat with your bot):
 
-Текущие ограничения этого этапа (Stage 4I — финальный интегрированный поток):
+| Message | Effect |
+| --- | --- |
+| `/start` | Short introduction and what the bot can do |
+| `/reset` | Clears this chat's short-term context; saved preferences are kept |
+| `Запомни: в примерах я предпочитаю httpx.` | Explicitly stores a preference (`Remember: …` also works) |
+| Any other text | Agent chooses documentation search, PyPI lookup, or preference recall |
 
-- разговорная память (`InMemoryConversationMemory`) — **process-local и не персистентная**:
-  хранится только в памяти процесса (последние 10 сообщений на `session_id`, включая
-  сообщения через Telegram) и полностью теряется при перезапуске процесса/бота;
-  персистентное хранилище (например, SQLite) — запланированное улучшение v2;
-- агент ограничен **одним** tool call на запрос (bounded execution): мульти-tool synthesis
-  (например, документация + PyPI в одном ответе) сознательно не реализован;
-- no-tool ответы модели полностью подавляются out-of-scope политикой — в том числе
-  безобидные приветствия получают безопасный fallback вместо small talk;
-- выбор инструмента — вероятностное решение модели: на живом трафике модель может изредка
-  выбрать не тот инструмент (safe fallback остаётся детерминированным);
-- ротация `USER_MEMORY_HASH_SECRET` делает ранее записанную память недостижимой через
-  новую identity (миграция identity не реализована);
-- дедупликация памяти — только детерминированная по нормализованному тексту; семантически
-  близкие, но текстуально разные statements сохраняются как отдельные записи;
-- управления долговременной памятью из чата (просмотр/удаление сохранённых предпочтений)
-  нет; `/reset` сознательно не трогает долговременную память;
-- Telegram bot — MVP без admin-доступа, без управления документами/индексацией через чат
-  (URL indexing через Telegram не реализовано и не планируется в этом виде), без streaming
-  ответов, без reranking, без claim-level верификации;
-- нет reranking результатов retrieval — используется порядок, возвращённый Pinecone, как есть;
-  answer layer поверх raw matches применяет только минимальный relevance gate `score >= 0.25`;
-- источники (`AnswerSource`) — document-level ссылки (страница + чанк), а не claim-level
-  citations (не привязаны к конкретному предложению или факту в ответе модели);
-- нет детерминированной claim-level верификации фактов и structured citations, нет
-  дополнительного verification pass (второго LLM-вызова/critic model) — grounding
-  обеспечивается только промптом и retrieved-контекстом, поэтому модель иногда может
-  добавить правдоподобную, но явно не подтверждённую контекстом деталь.
+## Testing and CI
 
-## Безопасность
+- **Offline tests** (`pytest -q`) need no network, real DNS or credentials: HTTP is faked with
+  `httpx.MockTransport`, DNS through an injectable resolver, and OpenAI/Pinecone/Telegram
+  through fakes and scripted tool-calling models.
+- **Lint:** `ruff check src tests scripts`.
+- **CI:** [GitHub Actions](.github/workflows/ci.yml) installs the package with its dev extras and
+  runs `pip check`, Ruff and pytest on **Python 3.11 and 3.12** for pushes to `main` and pull
+  requests. It uses no secrets and makes no live calls.
+- Live scripts (`index_url.py`, `ask_*.py`, the smoke test, the bot) are run manually and are not
+  part of the automated suite.
 
-Файл `.env` и любые секреты/API-ключи не должны попадать в Git. Используйте `.env.example`
-как шаблон и создавайте локальный `.env` только у себя, вне репозитория.
+## Evidence
+
+[`deliverables/evidence/final_acceptance/`](deliverables/evidence/final_acceptance/) holds nine
+screenshots from a manual live Telegram run on 2026-07-04: `/start`, a documentation answer
+with a source, PyPI lookup, explicit remember and recall, memory surviving `/reset`, a
+short-term alias being forgotten after `/reset`, and an out-of-scope refusal. See the
+[evidence index](deliverables/evidence/final_acceptance/README.md).
+
+This is **historical acceptance evidence, not current-state verification.** It predates the
+October 2026 hardening commits. What verifies the current code is the test suite and CI above.
+
+## Known limitations and design boundaries
+
+- **Grounding is best-effort.** Answers are model-generated from retrieved context without
+  claim-level verification; sources are page-level. There is no reranking (Pinecone's order is
+  used), and the two score thresholds are historical defaults rather than calibrated values.
+- **Single process, in-memory short-term history.** The last 10 messages per chat are kept in
+  process memory, are lost on restart, and rely on updates being handled one at a time (no
+  locking). Run one bot instance.
+- **No access control or rate limiting.** Anyone who can message the bot in a private chat can
+  use it, and each request spends OpenAI and Pinecone quota.
+- **Tool choice is probabilistic.** The model may pick a suboptimal tool; the one-call limit means
+  no multi-tool answers (for example, documentation plus PyPI in one reply). Harmless small
+  talk with no tool call also receives the fixed fallback.
+- **Memory is minimal.** No listing or deletion from chat; deduplication is exact after
+  normalization, not semantic; rotating `USER_MEMORY_HASH_SECRET` strands existing records.
+- **Indexing is operator-driven and not transactional.** No list/delete admin commands, no
+  distributed locking between concurrent writers of the same URL, a failed multi-batch upsert can
+  leave partial writes (re-running is safe because IDs are deterministic), and only static HTML
+  pages are supported (no JavaScript rendering or PDFs).
+- **SSRF protection is best-effort** (see the TOCTOU note above).
+- **Telegram:** text messages in private chats only; no streaming; user-facing strings are Russian.
+
+## Project status and possible next steps
+
+The core pipeline is complete and covered by tests; the repository is maintained as a
+portfolio artifact. Ideas that are explicitly *not* commitments:
+
+- retrieval evaluation set to calibrate thresholds and compare chunking settings;
+- document list/delete admin CLI;
+- scheduled or sitemap-based ingestion;
+- memory inspection and deletion;
+- persistent short-term history;
+- optional access control and rate limiting;
+- optional hosted deployment.
+
+## License
+
+[MIT](LICENSE) © 2026 eliv1982

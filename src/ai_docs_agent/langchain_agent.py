@@ -1,6 +1,6 @@
 """Real LangChain tool-calling orchestration over documentation search and PyPI lookup.
 
-The model's responsibility in this stage is autonomous tool selection. The final
+The model's responsibility is autonomous tool selection. The final
 user-facing answer is rendered from the authoritative tool output, not from an
 additional model synthesis pass, so current package metadata and documentation
 sources stay grounded in the actual tool results.

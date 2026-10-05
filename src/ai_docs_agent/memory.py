@@ -1,11 +1,11 @@
 """Short-term, process-local conversation memory (per session_id).
 
 Stores only the last `max_messages` user/assistant ConversationMessage turns per
-session, oldest first discarded. This is an intentional homework-MVP
-limitation: memory lives entirely in a plain in-process dict and is lost on
-process restart. Retrieved chunks, prompts, configuration, and exceptions are
-never stored -- only the normalized question text and the returned answer
-text. Persistent storage (e.g. SQLite) is deferred to a future version.
+session, oldest first discarded. By design the store is a plain in-process dict:
+it is lost on process restart and has no locking. Retrieved chunks, prompts,
+configuration, and exceptions are never stored -- only the normalized question
+text and the returned answer text. The Telegram runtime uses
+InMemoryConversationMemory through IntegratedConversationAgentService.
 """
 
 from ai_docs_agent.agent import DocumentationAnswerService
@@ -67,6 +67,10 @@ class InMemoryConversationMemory:
 
 class ConversationAnswerService:
     """Adds short-term conversation memory around DocumentationAnswerService.
+
+    A standalone documentation-only wrapper that is not used by the production
+    Telegram flow (see IntegratedConversationAgentService); it is retained
+    with its unit tests.
 
     Reads the session's stored history, forwards it to
     DocumentationAnswerService.answer(), and -- only once that call succeeds --

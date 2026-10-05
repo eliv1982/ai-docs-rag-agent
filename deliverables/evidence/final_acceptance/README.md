@@ -1,33 +1,27 @@
-# Final acceptance evidence (Stage 4I — integrated Telegram agent)
+# Final acceptance evidence
 
-Screenshots are created manually in Telegram after the live acceptance run of
-`python scripts/run_telegram_bot.py`. Nothing here is fabricated: this manifest
-only lists the expected filenames and what each screenshot must show.
+Screenshots from one manual, live run of the integrated Telegram bot
+(`python scripts/run_telegram_bot.py`) against a real Pinecone index, captured on
+2026-07-04 at commit `db7d147` ("Integrate Telegram agent and persistent memory"). The
+conversations are in Russian, matching the bot's user-facing strings.
 
-Checklist / expected files:
+These screenshots are historical acceptance evidence from 2026-07-04, not current-state
+verification. They predate the October 2026 hardening commits. Current behavior is verified by
+the automated test suite and CI.
 
-- [x] `01_start.png` — `/start` reply advertising documentation answers, PyPI
-  lookup, the explicit `Запомни: ...` command, and the accurate `/reset`
-  semantics (dialogue context cleared, saved preferences kept).
-- [x] `02_documentation_agent.png` — "Что такое embeddings в OpenAI API?" →
-  grounded answer with a real OpenAI documentation source
-  (documentation_search).
-- [x] `03_pypi_agent.png` — "Какая последняя версия пакета httpx на PyPI?" →
-  current live version with the PyPI source URL (pypi_lookup).
-- [x] `04_memory_remember.png` — "Запомни: в примерах я предпочитаю httpx." →
-  created/duplicate confirmation; no record ID, namespace, or digest shown.
-- [x] `05_memory_recall.png` — "Какую HTTP-библиотеку я предпочитаю?" →
-  answer contains httpx with the personal-memory source label
-  (user_memory_recall).
-- [x] `06_memory_survives_reset.png` — `/reset` followed by the same preference
-  question; httpx is still recalled from persistent memory.
-- [x] `07_short_term_alias.png` — alias set ("...называй
-  RecursiveCharacterTextSplitter Резаком.") followed by "Для чего нужен
-  Резак?" → grounded documentation answer.
-- [x] `08_reset_clears_alias.png` — `/reset` followed by "Для чего нужен
-  Резак?" → alias no longer resolves (safe no-context fallback).
-- [x] `09_out_of_scope.png` — "Как сварить борщ?" → safe fallback without
-  sources.
-- [x] `10_safe_agent_logs.png` — console logs proving tool selection and
-  memory outcomes (session hash, tool names, created/duplicate, counts) with
-  no question text, memory text, raw chat ID, user-memory namespace, or secrets.
+A tenth screenshot of console logs was removed from this set: it showed session hashes from the
+earlier unkeyed scheme, a derived memory-identity digest, and index and namespace names, and
+publishing them serves no purpose. Log content and its absence of question text, memory text and
+raw chat IDs are covered by the automated tests instead.
+
+| File | Prompt | What it shows |
+| --- | --- | --- |
+| `01_start.png` | `/start` | Introduction: documentation answers, PyPI lookup, the explicit `Запомни:` command, and `/reset` semantics |
+| `02_documentation_agent.png` | "Что такое embeddings в OpenAI API?" | Documentation answer with an OpenAI docs source URL (`documentation_search`) |
+| `03_pypi_agent.png` | "Какая последняя версия пакета httpx на PyPI?" | Live PyPI metadata with PyPI and project source URLs (`pypi_lookup`) |
+| `04_memory_remember.png` | "Запомни: в примерах я предпочитаю httpx." | Confirmation only; no record ID, namespace or digest is shown |
+| `05_memory_recall.png` | "Какую HTTP-библиотеку я предпочитаю?" | Recalled preference with the personal-memory label (`user_memory_recall`) |
+| `06_memory_survives_reset.png` | `/reset`, then the same question | The dialogue context is cleared; the saved preference is still recalled |
+| `07_short_term_alias.png` | "В этом диалоге называй RecursiveCharacterTextSplitter Резаком. Для чего он нужен?", then "Какие параметры есть у Резака?" | Short-term context resolves the alias; answers cite the LangChain splitter guide |
+| `08_reset_clears_alias.png` | `/reset`, then "Какие параметры есть у Резака?" | The alias is gone; the fixed no-context fallback is returned without sources |
+| `09_out_of_scope.png` | "Как сварить борщ?" | Fixed fallback without sources; no answer from general knowledge |

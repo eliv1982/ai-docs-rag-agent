@@ -1,4 +1,4 @@
-"""Integration-style tests for the final integrated agent flow (Stage 4I).
+"""Integration-style tests for the integrated agent flow.
 
 All tests use scripted fake tool-calling chat models and fake services only.
 No real OpenAI, Pinecone, PyPI, Telegram, or DNS calls occur here.

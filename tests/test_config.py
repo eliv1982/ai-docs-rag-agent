@@ -520,6 +520,32 @@ def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
         get_settings.cache_clear()
 
 
+def test_settings_load_from_the_default_dotenv_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Every other test passes _env_file=None. This one proves the configured
+    # env_file=".env" really loads (pydantic-settings needs python-dotenv for it,
+    # which is why python-dotenv is not declared separately).
+    for name in _ALL_SETTINGS_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / ".env").write_text(
+        "OPENAI_API_KEY=sk-from-dotenv\n"
+        "PINECONE_API_KEY=pc-from-dotenv\n"
+        "OPENAI_CHAT_MODEL=chat-model-from-dotenv\n"
+        "TELEGRAM_BOT_TOKEN=telegram-from-dotenv\n"
+        "USER_MEMORY_HASH_SECRET=memory-secret-from-dotenv\n"
+        "RETRIEVAL_TOP_K=7\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    settings = AppSettings()
+
+    assert settings.openai_api_key.get_secret_value() == "sk-from-dotenv"
+    assert settings.openai_chat_model == "chat-model-from-dotenv"
+    assert settings.retrieval_top_k == 7
+
+
 def test_rejects_missing_user_memory_hash_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in _ALL_SETTINGS_ENV_VARS:
         monkeypatch.delenv(name, raising=False)

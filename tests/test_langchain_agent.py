@@ -15,11 +15,13 @@ from langchain.agents import create_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
+from langgraph.errors import GraphRecursionError
 from pydantic import Field
 
 from ai_docs_agent.agent import AnswerGenerationError
 from ai_docs_agent.config import AppSettings
 from ai_docs_agent.langchain_agent import (
+    LangChainAgentExecutionError,
     LangChainToolCallingAgent,
     build_langchain_tools,
 )
@@ -398,24 +400,140 @@ def test_tool_outputs_do_not_expose_chunk_bodies_or_vectors() -> None:
     assert "chunk body" not in json.dumps(payload).lower()
 
 
+class CountingFakeModel(ToolFriendlyFakeModel):
+    """Counts real model steps (FakeMessagesListChatModel.i cycles, so it cannot)."""
+
+    generate_calls: int = 0
+
+    def _generate(self, *args: Any, **kwargs: Any) -> Any:
+        self.generate_calls += 1
+        return super()._generate(*args, **kwargs)
+
+
+class _GraphSpy:
+    """Delegates to the real compiled create_agent graph, recording invoke() traffic."""
+
+    def __init__(self, graph: Any) -> None:
+        self._graph = graph
+        self.configs: list[Any] = []
+        self.errors: list[BaseException] = []
+
+    def invoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        self.configs.append(config)
+        try:
+            return self._graph.invoke(input, config=config, **kwargs)
+        except BaseException as exc:
+            self.errors.append(exc)
+            raise
+
+
+def _bounded_agent(
+    model: ToolFriendlyFakeModel,
+    documentation_service: FakeDocumentationService,
+) -> tuple[LangChainToolCallingAgent, _GraphSpy]:
+    spies: list[_GraphSpy] = []
+
+    def spying_create_agent(**kwargs: Any) -> _GraphSpy:
+        spies.append(_GraphSpy(create_agent(**kwargs)))
+        return spies[0]
+
+    agent = LangChainToolCallingAgent(
+        make_settings(),
+        documentation_service=documentation_service,
+        pypi_service=FakePyPIService(result=make_pypi_info()),
+        chat_model=model,
+        agent_factory=spying_create_agent,
+    )
+    return agent, spies[0]
+
+
 def test_agent_execution_is_bounded_to_one_tool_call() -> None:
+    """Contract: recursion_limit=2 means one model step plus one tool step, then stop.
+
+    The graph is the real create_agent graph. A model that would happily keep
+    calling tools (and has a third scripted step ready) gets exactly one model
+    step and one tool execution; the resulting GraphRecursionError is raised by
+    LangGraph and absorbed into the normal tool-trace result.
+    """
     grounded = make_grounded_result(answer="Bounded answer.", retrieved_chunk_count=1)
-    model = ToolFriendlyFakeModel(
+    model = CountingFakeModel(
         responses=[
             make_tool_call_message("documentation_search", {"question": "Q1"}),
             make_tool_call_message("documentation_search", {"question": "Q2"}, call_id="call_2"),
+            AIMessage(content="A third model step must never run."),
         ]
     )
-    agent, documentation_service, _pypi_service = make_agent(
-        model=model,
-        documentation_service=FakeDocumentationService(result=grounded),
-    )
+    documentation_service = FakeDocumentationService(result=grounded)
+    agent, spy = _bounded_agent(model, documentation_service)
 
     result = agent.answer("Что такое embeddings в OpenAI API?")
 
+    assert model.generate_calls == 1  # no second model step after the tool step
+    assert documentation_service.calls == ["Q1"]  # Q2 was never executed
     assert result.tool_call_count == 1
-    assert documentation_service.calls == ["Q1"]
+    assert result.outcome == "success"
     assert result.answer == "Bounded answer."
+    assert "third model step" not in result.answer
+    assert spy.configs == [{"recursion_limit": 2}]
+    assert [type(error) for error in spy.errors] == [GraphRecursionError]
+
+
+@pytest.mark.parametrize(
+    "tool_call",
+    [
+        pytest.param(("no_such_tool", {"question": "Q1"}), id="unknown-tool"),
+        pytest.param(("documentation_search", {"wrong_argument": "Q1"}), id="invalid-arguments"),
+    ],
+)
+def test_recursion_limit_without_a_tool_result_gives_the_iteration_limit_fallback(
+    tool_call: tuple[str, dict[str, Any]],
+) -> None:
+    """A model step the tools node cannot satisfy must not buy a second model step.
+
+    The tools node answers with an error message instead of running a tool, so
+    the graph would loop back to the model; the recursion limit stops it first.
+    With no tool trace the agent returns its fixed iteration-limit fallback.
+    """
+    model = CountingFakeModel(
+        responses=[
+            make_tool_call_message(*tool_call),
+            make_tool_call_message("documentation_search", {"question": "Q2"}, call_id="call_2"),
+        ]
+    )
+    documentation_service = FakeDocumentationService(result=make_grounded_result())
+    agent, spy = _bounded_agent(model, documentation_service)
+
+    result = agent.answer("Что такое embeddings в OpenAI API?")
+
+    assert model.generate_calls == 1
+    assert documentation_service.calls == []
+    assert [type(error) for error in spy.errors] == [GraphRecursionError]
+    assert result.outcome == "safe_fallback"
+    assert result.failure_category == "agent_iteration_limit"
+    assert result.answer == "Не удалось безопасно подготовить ответ для этого запроса."
+    assert result.used_no_tool is True
+    assert result.tool_call_count == 0
+    assert result.tools_used == ()
+    assert result.sources == ()
+
+
+def test_only_graph_recursion_is_absorbed_other_graph_failures_are_wrapped() -> None:
+    """The recursion handler is narrow: any other graph error is not turned into a result."""
+
+    class BrokenGraph:
+        def invoke(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("graph exploded")
+
+    agent = LangChainToolCallingAgent(
+        make_settings(),
+        documentation_service=FakeDocumentationService(result=make_grounded_result()),
+        pypi_service=FakePyPIService(result=make_pypi_info()),
+        chat_model=ToolFriendlyFakeModel(responses=[AIMessage(content="unused")]),
+        agent_factory=lambda **kwargs: BrokenGraph(),
+    )
+
+    with pytest.raises(LangChainAgentExecutionError):
+        agent.answer("Что такое embeddings в OpenAI API?")
 
 
 def test_logs_are_privacy_safe_and_include_tool_diagnostics(

@@ -2,17 +2,22 @@
 
 Pipeline: URL -> UrlIngestionService.process_url -> DocumentChunk[] -> batch OpenAI
 embeddings -> batch Pinecone upsert -> bounded, cumulative fetch-based verification ->
-deletion of obsolete records for the same source_url in the same namespace: other
-document versions (different document_id) and stale chunks of the current document
-that fall outside its current chunk_count (e.g. after a chunking-config change that
-shrinks the chunk layout for unchanged content).
+deletion of obsolete records for the same source_url in the same namespace, limited to
+documentation records (kind == documentation_chunk): other document versions
+(different document_id) and stale chunks of the current document that fall outside its
+current chunk_count (e.g. after a chunking-config change that shrinks the chunk layout
+for unchanged content).
 """
 
 import time
 from collections.abc import Callable
 
 from ai_docs_agent.config import IndexingSettings
-from ai_docs_agent.models import DocumentIndexingResult, UrlProcessingResult
+from ai_docs_agent.models import (
+    DOCUMENTATION_CHUNK_KIND,
+    DocumentIndexingResult,
+    UrlProcessingResult,
+)
 from ai_docs_agent.pinecone_store import PineconeStore, PineconeStoreError
 from ai_docs_agent.url_ingestion import UrlIngestionService
 
@@ -197,19 +202,26 @@ class DocumentIndexingService:
         return found_ids
 
     def _cleanup_old_versions(self, processing: UrlProcessingResult, namespace: str) -> bool:
+        # The kind constraint wraps the whole destructive filter so a record of any
+        # other kind that happens to share this source_url can never be deleted.
         metadata_filter = {
-            "$or": [
+            "$and": [
+                {"kind": {"$eq": DOCUMENTATION_CHUNK_KIND}},
                 {
-                    "$and": [
-                        {"source_url": {"$eq": processing.source_url}},
-                        {"document_id": {"$ne": processing.document_id}},
-                    ]
-                },
-                {
-                    "$and": [
-                        {"source_url": {"$eq": processing.source_url}},
-                        {"document_id": {"$eq": processing.document_id}},
-                        {"chunk_index": {"$gte": processing.chunk_count}},
+                    "$or": [
+                        {
+                            "$and": [
+                                {"source_url": {"$eq": processing.source_url}},
+                                {"document_id": {"$ne": processing.document_id}},
+                            ]
+                        },
+                        {
+                            "$and": [
+                                {"source_url": {"$eq": processing.source_url}},
+                                {"document_id": {"$eq": processing.document_id}},
+                                {"chunk_index": {"$gte": processing.chunk_count}},
+                            ]
+                        },
                     ]
                 },
             ]

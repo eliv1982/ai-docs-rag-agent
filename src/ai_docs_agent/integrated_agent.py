@@ -37,7 +37,11 @@ from ai_docs_agent.langchain_agent import (
 )
 from ai_docs_agent.memory import InMemoryConversationMemory
 from ai_docs_agent.models import IntegratedAgentResult, LangChainAgentResult
-from ai_docs_agent.observability import current_request_session_hash, request_logging_context
+from ai_docs_agent.observability import (
+    configure_session_hash_secret,
+    current_request_session_hash,
+    request_logging_context,
+)
 from ai_docs_agent.pypi import PyPILookupService
 from ai_docs_agent.user_memory import (
     InvalidMemoryStatementError,
@@ -262,6 +266,9 @@ def build_integrated_service(
     time.
     """
     resolved_settings = settings or get_settings()
+    # Reuse the existing memory secret (under a separate HMAC input domain) so
+    # logged session hashes are keyed and stable across restarts.
+    configure_session_hash_secret(resolved_settings.user_memory_hash_secret.get_secret_value())
     documentation_service = DocumentationAnswerService(resolved_settings)
     pypi_service = PyPILookupService(resolved_settings)
     user_memory_service = UserMemoryService(resolved_settings)

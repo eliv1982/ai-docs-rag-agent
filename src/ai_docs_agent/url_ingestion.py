@@ -133,20 +133,34 @@ def _try_parse_ip_literal(
         return None
 
 
+def _is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True only for addresses appropriate for public Internet fetching.
+
+    The address must be globally routable per the standard library
+    (``is_global``), which already excludes RFC1918/ULA private space, loopback,
+    link-local, unspecified, documentation/benchmarking ranges and the CGNAT
+    shared space 100.64.0.0/10. Multicast, reserved and deprecated IPv6
+    site-local (fec0::/10) addresses are rejected explicitly because
+    ``is_global`` does not consistently exclude them. An IPv4-mapped IPv6
+    address (::ffff:a.b.c.d) is classified by its embedded IPv4 address, so the
+    outcome does not depend on how the running Python version treats the
+    ::ffff:0:0/96 prefix.
+    """
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if address.is_multicast or address.is_reserved:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.is_site_local:
+        return False
+    return address.is_global
+
+
 def _validate_resolved_addresses(addresses: Sequence[str], hostname: str) -> None:
     if not addresses:
         raise UnsafeUrlError(f"Hostname '{hostname}' did not resolve to any address.")
 
     for raw_address in addresses:
-        address = ipaddress.ip_address(raw_address)
-        if (
-            address.is_loopback
-            or address.is_private
-            or address.is_link_local
-            or address.is_multicast
-            or address.is_reserved
-            or address.is_unspecified
-        ):
+        if not _is_public_address(ipaddress.ip_address(raw_address)):
             raise UnsafeUrlError(
                 f"Hostname '{hostname}' resolves to a disallowed address '{raw_address}'."
             )

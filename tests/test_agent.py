@@ -99,10 +99,22 @@ class FakeChatClient:
         self._answers = list(answers) if answers is not None else None
         self._error = error
         self.calls: list[dict[str, str]] = []
+        self.decoding: list[dict[str, Any]] = []
 
-    def complete(self, *, model: str, system_prompt: str, user_prompt: str) -> str:
+    def complete(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
+    ) -> str:
         self.calls.append(
             {"model": model, "system_prompt": system_prompt, "user_prompt": user_prompt}
+        )
+        self.decoding.append(
+            {"temperature": temperature, "max_output_tokens": max_output_tokens}
         )
         if self._error is not None:
             raise self._error
@@ -395,6 +407,98 @@ def test_relevance_gate_filters_only_the_low_score_chunks() -> None:
     prompt = chat.calls[0]["user_prompt"]
     assert "Relevant Page" in prompt
     assert "Irrelevant Page" not in prompt
+
+
+def test_default_relevance_threshold_is_0_25_and_is_inclusive() -> None:
+    assert make_settings().retrieval_score_threshold == 0.25
+    at_threshold = make_chunk(chunk_id="at", document_id="doc-at", score=0.25, title="At Threshold")
+    just_below = make_chunk(
+        chunk_id="below", document_id="doc-below", score=0.2499, title="Just Below"
+    )
+    retrieval = FakeRetrievalService(
+        result=make_retrieval_result(matches=(at_threshold, just_below))
+    )
+    service, _retrieval, chat = make_service(retrieval=retrieval)
+
+    result = service.answer("query")
+
+    assert [source.title for source in result.sources] == ["At Threshold"]
+    assert "Just Below" not in chat.calls[0]["user_prompt"]
+
+
+def test_retrieval_uses_the_configured_relevance_threshold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    kept = make_chunk(chunk_id="kept", document_id="doc-kept", score=0.6, title="Kept Page")
+    dropped = make_chunk(
+        chunk_id="dropped", document_id="doc-dropped", score=0.4, title="Dropped Page"
+    )
+    retrieval = FakeRetrievalService(result=make_retrieval_result(matches=(kept, dropped)))
+    service, _retrieval, chat = make_service(
+        settings=make_settings(retrieval_score_threshold=0.5), retrieval=retrieval
+    )
+
+    with caplog.at_level(logging.INFO):
+        result = service.answer("query")
+
+    assert [source.title for source in result.sources] == ["Kept Page"]
+    assert "Dropped Page" not in chat.calls[0]["user_prompt"]
+    assert "score_threshold=0.50" in caplog.text
+
+
+def test_lowering_the_configured_threshold_admits_chunks_the_default_rejects() -> None:
+    chunk = make_chunk(score=0.0556)
+    retrieval = FakeRetrievalService(result=make_retrieval_result(matches=(chunk,)))
+    service, _retrieval, chat = make_service(
+        settings=make_settings(retrieval_score_threshold=0.05), retrieval=retrieval
+    )
+
+    result = service.answer("Как приготовить борщ?")
+
+    assert result.retrieved_chunk_count == 1
+    assert chat.calls
+
+
+# --- grounded-answer decoding controls ---------------------------------------------
+
+
+def test_grounded_answer_call_requests_deterministic_bounded_generation() -> None:
+    service, _retrieval, chat = make_service()
+
+    service.answer("how do I configure the client?")
+
+    assert len(chat.decoding) == 1
+    controls = chat.decoding[0]
+    assert controls["temperature"] == 0
+    assert isinstance(controls["max_output_tokens"], int)
+    assert 0 < controls["max_output_tokens"] <= 4096
+
+
+def test_contextual_query_rewrite_call_carries_no_decoding_controls() -> None:
+    history = (
+        make_message("user", "В этом диалоге называй RecursiveCharacterTextSplitter Резаком."),
+        make_message("assistant", "Хорошо, буду называть RecursiveCharacterTextSplitter Резаком."),
+    )
+    retrieval = FakeRetrievalService(
+        results=[
+            make_retrieval_result(query="Для чего нужен Резак?", matches=()),
+            make_retrieval_result(
+                query="Для чего нужен RecursiveCharacterTextSplitter?",
+                matches=(make_chunk(score=0.58),),
+            ),
+        ]
+    )
+    chat = FakeChatClient(
+        answers=["Для чего нужен RecursiveCharacterTextSplitter?", "Он разбивает текст."]
+    )
+    service, _retrieval, _chat = make_service(retrieval=retrieval, chat=chat)
+
+    service.answer("Для чего нужен Резак?", history=history)
+
+    rewrite_controls, answer_controls = chat.decoding
+    assert rewrite_controls == {"temperature": None, "max_output_tokens": None}
+    assert answer_controls["temperature"] == 0
+    assert answer_controls["max_output_tokens"] is not None
 
 
 # --- sources -----------------------------------------------------------------------

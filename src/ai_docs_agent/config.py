@@ -305,12 +305,26 @@ class AnswerSettings(VectorStoreSettings):
     """Grounded documentation answering: retrieval plus the OpenAI chat model."""
 
     openai_chat_model: str = Field(validation_alias="OPENAI_CHAT_MODEL")
+    # Documentation relevance gate: retrieved chunks scoring below this cosine
+    # similarity are discarded before answering. The default preserves the
+    # historical value; it has not been re-calibrated.
+    retrieval_score_threshold: float = Field(
+        default=0.25, validation_alias="RETRIEVAL_SCORE_THRESHOLD"
+    )
 
     @field_validator("openai_chat_model")
     @classmethod
     def _validate_chat_model_non_empty(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("must not be empty.")
+        return value
+
+    @field_validator("retrieval_score_threshold")
+    @classmethod
+    def _validate_retrieval_score_threshold(cls, value: float) -> float:
+        # Written as a negated range check so NaN is rejected as well.
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("retrieval_score_threshold must be between 0.0 and 1.0 inclusive.")
         return value
 
 

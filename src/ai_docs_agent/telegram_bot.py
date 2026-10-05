@@ -48,7 +48,6 @@ from telegram.ext import (
     filters,
 )
 
-from ai_docs_agent.agent import get_retrieval_score_threshold
 from ai_docs_agent.config import AppSettings, get_settings
 from ai_docs_agent.integrated_agent import (
     IntegratedConversationAgentService,
@@ -287,5 +286,5 @@ def build_startup_summary(settings: AppSettings) -> TelegramStartupSummary:
         pinecone_namespace=settings.pinecone_documents_namespace,
         embedding_model=settings.openai_embedding_model,
         retrieval_top_k=settings.retrieval_top_k,
-        score_threshold=get_retrieval_score_threshold(),
+        score_threshold=settings.retrieval_score_threshold,
     )

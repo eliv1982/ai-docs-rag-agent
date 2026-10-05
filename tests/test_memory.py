@@ -292,7 +292,15 @@ class FakeChatClient:
         self._answers = list(answers)
         self.calls: list[dict[str, str]] = []
 
-    def complete(self, *, model: str, system_prompt: str, user_prompt: str) -> str:
+    def complete(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
+    ) -> str:
         self.calls.append(
             {"model": model, "system_prompt": system_prompt, "user_prompt": user_prompt}
         )

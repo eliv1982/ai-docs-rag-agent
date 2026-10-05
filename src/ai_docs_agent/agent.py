@@ -1,7 +1,7 @@
 """Minimal grounded RAG answering: retrieval -> LLM prompt -> answer + sources.
 
-Pipeline: question -> RetrievalService.search() -> matches below
-_MIN_RELEVANCE_SCORE discarded -> compact grounded prompt (history, then
+Pipeline: question -> RetrievalService.search() -> matches below the configured
+retrieval_score_threshold discarded -> compact grounded prompt (history, then
 documentation context, then the current user message last; retrieved text and
 any supplied conversation history are treated as untrusted data, never as
 instructions) -> one plain-text chat completion -> stripped answer +
@@ -43,11 +43,11 @@ _MAX_HISTORY_MESSAGES = 10
 
 _EMPTY_HISTORY_BLOCK = "Conversation history:\n(no prior conversation history)"
 
-# Calibrated against live retrieval scores on the single-document namespace
-# used for manual checks: on-topic Russian queries scored ~0.49-0.65 while an
-# unrelated query scored ~0.06, so a match below this is treated as noise
-# rather than as evidence the namespace actually has relevant documentation.
-_MIN_RELEVANCE_SCORE = 0.25
+# Decoding controls for the grounded-answer call only: low-randomness generation
+# and a finite output cap (max_completion_tokens, which counts every generated
+# token; the older max_tokens is deprecated and rejected by newer models).
+_ANSWER_TEMPERATURE = 0.0
+_ANSWER_MAX_OUTPUT_TOKENS = 1024
 
 _TOP_SCORE_LOG_LIMIT = 5
 _DIRECT_RETRIEVAL_PASS = "direct"
@@ -57,11 +57,6 @@ _CONTEXTUAL_RETRY_REASON_NO_HISTORY = "no_history"
 _CONTEXTUAL_RETRY_REASON_ELIGIBLE = "eligible"
 
 logger = logging.getLogger(__name__)
-
-
-def get_retrieval_score_threshold() -> float:
-    """Return the minimum similarity score accepted by the answer service."""
-    return _MIN_RELEVANCE_SCORE
 
 
 @dataclass(frozen=True)
@@ -149,7 +144,15 @@ class AnswerGenerationError(AnswerServiceError):
 class ChatClient(Protocol):
     """Structural interface for the chat-completion client used by the answer service."""
 
-    def complete(self, *, model: str, system_prompt: str, user_prompt: str) -> str: ...
+    def complete(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
+    ) -> str: ...
 
 
 class OpenAIChatClient:
@@ -171,15 +174,36 @@ class OpenAIChatClient:
             self._client = OpenAI(**kwargs)
         return self._client
 
-    def complete(self, *, model: str, system_prompt: str, user_prompt: str) -> str:
-        response = self._openai_client.chat.completions.create(
-            model=model,
-            messages=[
+    def complete(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        request: dict[str, Any] = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-        )
-        return response.choices[0].message.content or ""
+        }
+        if temperature is not None:
+            request["temperature"] = temperature
+        if max_output_tokens is not None:
+            request["max_completion_tokens"] = max_output_tokens
+        response = self._openai_client.chat.completions.create(**request)
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            logger.warning(
+                "Chat completion stopped at the output token limit session_hash=%s "
+                "max_output_tokens=%s",
+                current_request_session_hash() or "-",
+                max_output_tokens,
+            )
+        return choice.message.content or ""
 
 
 class DocumentationAnswerService:
@@ -193,6 +217,7 @@ class DocumentationAnswerService:
         chat_client: ChatClient | None = None,
     ) -> None:
         self._settings = settings
+        self._score_threshold = settings.retrieval_score_threshold
         self._retrieval_service = retrieval_service or RetrievalService(settings)
         self._chat_client = chat_client or OpenAIChatClient(settings)
 
@@ -269,6 +294,7 @@ class DocumentationAnswerService:
                 top_candidate_scores=self._top_candidate_scores(
                     last_attempt.retrieval_result.matches
                 ),
+                score_threshold=self._score_threshold,
                 outcome="no_context",
                 retrieval_path=last_attempt.retrieval_pass,
                 elapsed_seconds=time.monotonic() - started_at,
@@ -289,6 +315,8 @@ class DocumentationAnswerService:
                 model=self._settings.openai_chat_model,
                 system_prompt=_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
+                temperature=_ANSWER_TEMPERATURE,
+                max_output_tokens=_ANSWER_MAX_OUTPUT_TOKENS,
             )
         except Exception as exc:
             raise AnswerGenerationError(
@@ -314,6 +342,7 @@ class DocumentationAnswerService:
             top_candidate_scores=self._top_candidate_scores(
                 selected_attempt.retrieval_result.matches
             ),
+            score_threshold=self._score_threshold,
             outcome="grounded",
             retrieval_path=selected_attempt.retrieval_pass,
             elapsed_seconds=time.monotonic() - started_at,
@@ -477,7 +506,7 @@ class DocumentationAnswerService:
         relevant_matches = tuple(
             match
             for match in retrieval_result.matches
-            if match.score >= _MIN_RELEVANCE_SCORE
+            if match.score >= self._score_threshold
         )
         self._log_retrieval_attempt(
             retrieval_pass=retrieval_pass,
@@ -546,6 +575,7 @@ class DocumentationAnswerService:
         raw_candidate_count: int,
         accepted_candidate_count: int,
         top_candidate_scores: tuple[float, ...],
+        score_threshold: float,
         outcome: str,
         retrieval_path: str,
         elapsed_seconds: float,
@@ -562,7 +592,7 @@ class DocumentationAnswerService:
             raw_candidate_count,
             accepted_candidate_count,
             list(top_candidate_scores),
-            _MIN_RELEVANCE_SCORE,
+            score_threshold,
             outcome,
             retrieval_path,
             round(elapsed_seconds * 1000),

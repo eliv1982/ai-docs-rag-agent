@@ -665,18 +665,23 @@ def test_cleanup_filter_has_exact_structure() -> None:
 
     metadata_filter, namespace = store.delete_calls[0]
     assert metadata_filter == {
-        "$or": [
+        "$and": [
+            {"kind": {"$eq": "documentation_chunk"}},
             {
-                "$and": [
-                    {"source_url": {"$eq": "https://docs.example.com/page"}},
-                    {"document_id": {"$ne": "doc-current"}},
-                ]
-            },
-            {
-                "$and": [
-                    {"source_url": {"$eq": "https://docs.example.com/page"}},
-                    {"document_id": {"$eq": "doc-current"}},
-                    {"chunk_index": {"$gte": 3}},
+                "$or": [
+                    {
+                        "$and": [
+                            {"source_url": {"$eq": "https://docs.example.com/page"}},
+                            {"document_id": {"$ne": "doc-current"}},
+                        ]
+                    },
+                    {
+                        "$and": [
+                            {"source_url": {"$eq": "https://docs.example.com/page"}},
+                            {"document_id": {"$eq": "doc-current"}},
+                            {"chunk_index": {"$gte": 3}},
+                        ]
+                    },
                 ]
             },
         ]
@@ -696,6 +701,7 @@ def test_cleanup_filter_matches_old_document_version_of_same_source_url() -> Non
 
     metadata_filter, _namespace = store.delete_calls[0]
     old_version_chunk = {
+        "kind": "documentation_chunk",
         "source_url": "https://docs.example.com/page",
         "document_id": "doc-old",
         "chunk_index": 0,
@@ -716,6 +722,7 @@ def test_cleanup_filter_does_not_match_current_document_chunks_below_chunk_count
     metadata_filter, _namespace = store.delete_calls[0]
     for index in range(3):
         current_chunk = {
+            "kind": "documentation_chunk",
             "source_url": "https://docs.example.com/page",
             "document_id": "doc-current",
             "chunk_index": index,
@@ -735,6 +742,7 @@ def test_cleanup_filter_matches_stale_chunk_index_at_or_above_chunk_count() -> N
 
     metadata_filter, _namespace = store.delete_calls[0]
     stale_chunk = {
+        "kind": "documentation_chunk",
         "source_url": "https://docs.example.com/page",
         "document_id": "doc-current",
         "chunk_index": 3,
@@ -754,6 +762,7 @@ def test_cleanup_filter_does_not_match_a_different_source_url() -> None:
 
     metadata_filter, _namespace = store.delete_calls[0]
     other_source_chunk = {
+        "kind": "documentation_chunk",
         "source_url": "https://docs.example.com/other-page",
         "document_id": "doc-other",
         "chunk_index": 0,
@@ -780,11 +789,57 @@ def test_cleanup_filter_covers_same_hash_shrink_scenario_without_orphan_chunks()
 
     metadata_filter, _namespace = store.delete_calls[0]
     orphan_chunk_from_old_layout = {
+        "kind": "documentation_chunk",
         "source_url": "https://docs.example.com/page",
         "document_id": "doc-same",
         "chunk_index": 4,
     }
     assert _evaluate_pinecone_filter(metadata_filter, orphan_chunk_from_old_layout) is True
+
+
+def test_cleanup_deletes_stale_documentation_records_but_spares_other_kinds() -> None:
+    source_url = "https://docs.example.com/page"
+    processing = make_processing(source_url=source_url, document_id="doc-current", chunk_count=2)
+    service, _url_service, store = make_service(
+        url_service=FakeUrlIngestionService(result=processing)
+    )
+
+    service.index_url(source_url)
+
+    def record(record_id: str, *, kind: str, document_id: str, chunk_index: int) -> dict[str, Any]:
+        return {
+            "id": record_id,
+            "metadata": {
+                "kind": kind,
+                "source_url": source_url,
+                "document_id": document_id,
+                "chunk_index": chunk_index,
+            },
+        }
+
+    stored = [
+        # current document, within chunk_count: kept
+        record("current-0", kind="documentation_chunk", document_id="doc-current", chunk_index=0),
+        record("current-1", kind="documentation_chunk", document_id="doc-current", chunk_index=1),
+        # stale documentation records for the same source: deleted
+        record("old-version", kind="documentation_chunk", document_id="doc-old", chunk_index=0),
+        record("stale-tail", kind="documentation_chunk", document_id="doc-current", chunk_index=2),
+        # same source_url but a different kind: must survive, even though every
+        # other field would otherwise match the stale-version clauses
+        record("memory-old-version", kind="user_memory", document_id="doc-old", chunk_index=0),
+        record("memory-stale-tail", kind="user_memory", document_id="doc-current", chunk_index=2),
+    ]
+
+    metadata_filter, _namespace = store.delete_calls[0]
+    deleted = {
+        item["id"]
+        for item in stored
+        if _evaluate_pinecone_filter(metadata_filter, item["metadata"])
+    }
+    survivors = {item["id"] for item in stored} - deleted
+
+    assert deleted == {"old-version", "stale-tail"}
+    assert survivors == {"current-0", "current-1", "memory-old-version", "memory-stale-tail"}
 
 
 # --- idempotency / determinism ------------------------------------------------------

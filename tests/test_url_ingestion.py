@@ -26,6 +26,7 @@ from ai_docs_agent.url_ingestion import (
     _normalize_pre_text,
     _normalize_text,
     _trim_chunk_text,
+    _validate_resolved_addresses,
 )
 
 _REQUIRED: dict[str, Any] = {
@@ -252,6 +253,178 @@ def test_process_url_accepts_valid_public_url() -> None:
 
     assert result.source_url == "http://docs.example.com/page"
     assert result.final_url == "http://docs.example.com/page"
+
+
+# --- Address policy (public-Internet-only) -----------------------------------
+# Pure classification tests: addresses are fed straight to the validator, so no
+# DNS lookup or HTTP request is ever made.
+
+_BLOCKED_ADDRESSES = [
+    # RFC1918 private
+    "10.0.0.1",
+    "10.255.255.255",
+    "172.16.0.1",
+    "172.31.255.255",
+    "192.168.1.1",
+    # loopback
+    "127.0.0.1",
+    "127.255.255.254",
+    "::1",
+    # link-local (incl. cloud metadata endpoint)
+    "169.254.169.254",
+    "169.254.0.1",
+    "fe80::1",
+    # unspecified / "this network"
+    "0.0.0.0",
+    "0.1.2.3",
+    "::",
+    # multicast
+    "224.0.0.1",
+    "239.255.255.250",
+    "ff02::1",
+    # reserved / broadcast
+    "240.0.0.1",
+    "255.255.255.255",
+    # CGNAT / shared address space 100.64.0.0/10 (incl. a cloud metadata address)
+    "100.64.0.0",
+    "100.64.0.1",
+    "100.100.100.200",
+    "100.127.255.255",
+    # documentation / benchmarking special-use ranges
+    "192.0.2.1",
+    "198.51.100.1",
+    "203.0.113.1",
+    "198.18.0.1",
+    "2001:db8::1",
+    # IPv6 unique-local and deprecated site-local
+    "fc00::1",
+    "fd00::1",
+    "fec0::1",
+    # IPv4-mapped equivalents of blocked IPv4 addresses
+    "::ffff:127.0.0.1",
+    "::ffff:10.0.0.1",
+    "::ffff:192.168.1.1",
+    "::ffff:169.254.169.254",
+    "::ffff:0.0.0.0",
+    "::ffff:224.0.0.1",
+    "::ffff:100.64.0.1",
+    "::ffff:100.100.100.200",
+]
+
+_PUBLIC_ADDRESSES = [
+    # ordinary globally routable IPv4
+    "8.8.8.8",
+    "1.1.1.1",
+    "93.184.216.34",
+    # either side of the CGNAT block is ordinary public space
+    "100.63.255.255",
+    "100.128.0.0",
+    # either side of the RFC1918 172.16.0.0/12 block
+    "172.15.255.255",
+    "172.32.0.0",
+    # ordinary globally routable IPv6
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888",
+    # IPv4-mapped form of a public address follows the IPv4 classification
+    "::ffff:8.8.8.8",
+]
+
+
+@pytest.mark.parametrize("address", _BLOCKED_ADDRESSES)
+def test_address_policy_rejects_non_public_address(address: str) -> None:
+    with pytest.raises(UnsafeUrlError):
+        _validate_resolved_addresses([address], "host.example.com")
+
+
+@pytest.mark.parametrize("address", _PUBLIC_ADDRESSES)
+def test_address_policy_accepts_public_address(address: str) -> None:
+    _validate_resolved_addresses([address], "host.example.com")
+
+
+def test_address_policy_rejects_when_any_answer_is_non_public() -> None:
+    with pytest.raises(UnsafeUrlError):
+        _validate_resolved_addresses(["8.8.8.8", "100.100.100.200"], "mixed.example.com")
+
+
+@pytest.mark.parametrize("address", ["100.64.0.1", "100.100.100.200"])
+def test_process_url_rejects_cgnat_ip_literal(address: str) -> None:
+    service = UrlIngestionService(
+        make_settings(),
+        http_client=make_client(forbidden_transport_handler),
+        host_resolver=make_resolver({}),
+    )
+    with pytest.raises(UnsafeUrlError):
+        service.process_url(f"http://{address}/latest/meta-data/")
+
+
+def test_process_url_rejects_ipv4_mapped_cgnat_ip_literal() -> None:
+    service = UrlIngestionService(
+        make_settings(),
+        http_client=make_client(forbidden_transport_handler),
+        host_resolver=make_resolver({}),
+    )
+    with pytest.raises(UnsafeUrlError):
+        service.process_url("http://[::ffff:100.100.100.200]/page")
+
+
+def test_process_url_rejects_dns_returning_cgnat_address() -> None:
+    service = UrlIngestionService(
+        make_settings(),
+        http_client=make_client(forbidden_transport_handler),
+        host_resolver=make_resolver({"metadata.example.com": ["100.100.100.200"]}),
+    )
+    with pytest.raises(UnsafeUrlError):
+        service.process_url("http://metadata.example.com/page")
+
+
+def test_process_url_rejects_dns_returning_public_and_cgnat_addresses() -> None:
+    service = UrlIngestionService(
+        make_settings(),
+        http_client=make_client(forbidden_transport_handler),
+        host_resolver=make_resolver({"mixed.example.com": ["8.8.8.8", "100.64.0.1"]}),
+    )
+    with pytest.raises(UnsafeUrlError):
+        service.process_url("http://mixed.example.com/page")
+
+
+@pytest.mark.parametrize("shorthand", ["127.1", "2130706433", "0x7f.1", "0177.0.0.1"])
+def test_process_url_rejects_numeric_shorthand_for_loopback(shorthand: str) -> None:
+    # Non-canonical numeric hosts are not parsed as IP literals; they go through
+    # DNS resolution, where the resolver (like getaddrinfo) yields 127.0.0.1.
+    service = UrlIngestionService(
+        make_settings(),
+        http_client=make_client(forbidden_transport_handler),
+        host_resolver=make_resolver({shorthand: ["127.0.0.1"]}),
+    )
+    with pytest.raises(UnsafeUrlError):
+        service.process_url(f"http://{shorthand}/page")
+
+
+def test_process_url_accepts_dns_answer_on_either_side_of_cgnat_block() -> None:
+    settings = make_settings(url_min_text_chars=10)
+    service = UrlIngestionService(
+        settings,
+        http_client=make_client(lambda request: html_response()),
+        host_resolver=make_resolver({"docs.example.com": ["100.63.255.255", "100.128.0.0"]}),
+    )
+
+    result = service.process_url("http://docs.example.com/page")
+
+    assert result.chunk_count >= 1
+
+
+def test_redirect_to_cgnat_target_is_blocked() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "http://100.100.100.200/latest"})
+
+    service = UrlIngestionService(
+        make_settings(url_min_text_chars=10),
+        http_client=make_client(handler),
+        host_resolver=make_resolver({"docs.example.com": ["8.8.8.8"]}),
+    )
+
+    with pytest.raises(UnsafeUrlError):
+        service.process_url("http://docs.example.com/page")
 
 
 # --- Redirects -------------------------------------------------------------

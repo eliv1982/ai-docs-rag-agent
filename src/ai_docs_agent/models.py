@@ -24,6 +24,9 @@ AgentExecutionOutcome = Literal["success", "safe_fallback"]
 UserMemoryToolStatus = Literal["success", "no_match", "memory_unavailable", "recall_failure"]
 UserMemoryWriteToolStatus = Literal["created", "duplicate"]
 
+# Metadata "kind" carried by every indexed documentation record.
+DOCUMENTATION_CHUNK_KIND = "documentation_chunk"
+
 
 class PineconeIndexStatus(BaseModel):
     """Snapshot of a Pinecone index's configuration and readiness."""
@@ -110,7 +113,7 @@ class DocumentChunk(BaseModel):
     def to_pinecone_metadata(self) -> dict[str, str | int]:
         """Return a flat metadata dict containing only Pinecone-safe scalar values."""
         return {
-            "kind": "documentation_chunk",
+            "kind": DOCUMENTATION_CHUNK_KIND,
             "text": self.text,
             "document_id": self.document_id,
             "source_url": self.source_url,

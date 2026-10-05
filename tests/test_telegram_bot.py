@@ -7,6 +7,8 @@ Telegram, OpenAI, Pinecone, or PyPI calls, and no polling is ever started.
 """
 
 import asyncio
+import hashlib
+import hmac
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -274,7 +276,15 @@ class FactoryFakeChatClient:
         self.calls: list[dict[str, str]] = []
         FactoryFakeChatClient.instances.append(self)
 
-    def complete(self, *, model: str, system_prompt: str, user_prompt: str) -> str:
+    def complete(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
+    ) -> str:
         self.calls.append(
             {"model": model, "system_prompt": system_prompt, "user_prompt": user_prompt}
         )
@@ -813,6 +823,23 @@ def test_build_application_records_safe_startup_summary() -> None:
         retrieval_top_k=7,
         score_threshold=build_startup_summary(settings).score_threshold,
     )
+
+
+def test_startup_summary_reports_the_configured_retrieval_threshold() -> None:
+    assert build_startup_summary(make_settings()).score_threshold == 0.25
+    configured = build_startup_summary(make_settings(retrieval_score_threshold=0.4))
+    assert configured.score_threshold == 0.4
+
+
+def test_build_application_keys_session_hashes_with_the_memory_secret() -> None:
+    settings = make_settings(user_memory_hash_secret="factory-level-secret")
+
+    build_application(settings, chat_model=ScriptedDocsToolModel())
+
+    expected = hmac.new(
+        b"factory-level-secret", b"observability-session:424242", hashlib.sha256
+    ).hexdigest()[:12]
+    assert hash_session_id("424242") == expected
 
 
 def test_build_application_uses_injected_settings_for_answer_service(

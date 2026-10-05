@@ -48,6 +48,7 @@ _ALL_SETTINGS_ENV_VARS = (
     "PINECONE_INDEX_VERIFY_POLL_INTERVAL_SECONDS",
     "PINECONE_REPLACE_OLD_SOURCE_VERSIONS",
     "RETRIEVAL_TOP_K",
+    "RETRIEVAL_SCORE_THRESHOLD",
     "PYPI_BASE_URL",
     "PYPI_TIMEOUT_SECONDS",
     "TELEGRAM_BOT_TOKEN",
@@ -92,6 +93,7 @@ def test_defaults() -> None:
     assert settings.pinecone_index_verify_poll_interval_seconds == 1
     assert settings.pinecone_replace_old_source_versions is True
     assert settings.retrieval_top_k == 5
+    assert settings.retrieval_score_threshold == 0.25
     assert settings.pypi_base_url == "https://pypi.org"
     assert settings.pypi_timeout_seconds == 10
     assert settings.user_memory_namespace_prefix == "user-memory"
@@ -345,6 +347,40 @@ def test_retrieval_top_k_reads_from_environment_variable(
     settings = AppSettings(_env_file=None)
 
     assert settings.retrieval_top_k == 12
+
+
+def test_retrieval_score_threshold_defaults_to_the_historical_value() -> None:
+    assert make_settings().retrieval_score_threshold == 0.25
+
+
+@pytest.mark.parametrize("value", [0.0, 0.1, 0.4, 1.0])
+def test_retrieval_score_threshold_accepts_values_in_range(value: float) -> None:
+    assert make_settings(retrieval_score_threshold=value).retrieval_score_threshold == value
+
+
+def test_retrieval_score_threshold_reads_from_environment_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in _ALL_SETTINGS_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+    monkeypatch.setenv("PINECONE_API_KEY", "pc-test-key")
+    monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-telegram-token")
+    monkeypatch.setenv("USER_MEMORY_HASH_SECRET", "env-user-memory-secret")
+    monkeypatch.setenv("RETRIEVAL_SCORE_THRESHOLD", "0.4")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.retrieval_score_threshold == 0.4
+
+
+@pytest.mark.parametrize(
+    "value", [-0.01, 1.01, 5, float("nan"), float("inf"), float("-inf"), "high"]
+)
+def test_rejects_invalid_retrieval_score_threshold(value: Any) -> None:
+    with pytest.raises(ValidationError):
+        make_settings(retrieval_score_threshold=value)
 
 
 def test_rejects_zero_retrieval_top_k() -> None:
